@@ -587,7 +587,7 @@ var clientPacketSizes = map[byte]int{
 	0x0D: 65,
 	0x10: 66,
 	0x11: 68,
-	0x12: 1,
+	0x13: 1, // <--- CHANGED FROM 0x12 to 0x13
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -670,7 +670,7 @@ func handleConnection(conn net.Conn, server *Server) {
 		}
 
 		if clientSupportsCustomBlocks {
-			writeUint8(conn, 0x12)
+			writeUint8(conn, 0x13) // <--- CHANGED FROM 0x12
 			writeUint8(conn, 1)
 
 			pidBuf := make([]byte, 1)
