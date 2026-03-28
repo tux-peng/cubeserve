@@ -610,7 +610,7 @@ func handleConnection(conn net.Conn, server *Server) {
 	}
 
 	// ALWAYS send ServerIdentification first
-	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
 	// --- CPE Handshake ---
 	clientSupportsCustomBlocks := false
@@ -681,7 +681,10 @@ func handleConnection(conn net.Conn, server *Server) {
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	// Send Definitions safely after handshake completes
+	// 1. ✅ ALWAYS send ServerIdentification AFTER the CPE Handshake completes
+	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+
+	// 2. ✅ Send Block Definitions SAFELY AFTER ServerIdentification
 	if clientSupportsBlockDefs {
 		sendBlockDefinitions(conn)
 	}
