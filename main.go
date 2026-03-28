@@ -368,18 +368,19 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 // ═══════════════════════════════════════════════════════════════════
 
 type Player struct {
-	Conn           net.Conn
-	Username       string
-	World          *World
-	Server         *Server
-	X, Y, Z        int16
-	Yaw, Pitch     byte
-	Authenticated  map[string]bool
-	SavedPasswords map[string]string
-	PendingWorld   *World
-	SupportsCPE    bool
-	IsOp           bool
-	mu             sync.Mutex
+	Conn              net.Conn
+	Username          string
+	World             *World
+	Server            *Server
+	X, Y, Z           int16
+	Yaw, Pitch        byte
+	Authenticated     map[string]bool
+	SavedPasswords    map[string]string
+	PendingWorld      *World
+	SupportsCPE       bool
+	SupportsHeldBlock bool
+	IsOp              bool
+	mu                sync.Mutex
 }
 
 func (p *Player) SendMessage(msg string) {
@@ -390,7 +391,7 @@ func (p *Player) SendMessage(msg string) {
 	p.Conn.Write(pkt)
 }
 
-// Blocks 50-65 Fallback mechanism for Vanilla Classic Clients
+// Fallback mechanism for Vanilla Classic Clients
 func getFallbackBlock(b byte) byte {
 	switch b {
 	case 50:
@@ -427,7 +428,7 @@ func getFallbackBlock(b byte) byte {
 		return 1 // Stone Brick -> Stone
 	default:
 		if b > 49 {
-			return 1 // Stone fallback for undefined
+			return 1
 		}
 		return b
 	}
@@ -452,7 +453,6 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.mu.Lock()
 		authed := p.Authenticated[target.Name]
 		if !authed {
-			// Auto-authenticate if we have a matching saved password
 			if savedPw, ok := p.SavedPasswords[target.Name]; ok && savedPw == pw {
 				p.Authenticated[target.Name] = true
 				authed = true
@@ -494,6 +494,7 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.Yaw, p.Pitch = syaw, spitch
 	}
 
+	// 0x08 is used for teleporting/spawning the local player correctly.
 	writeUint8(p.Conn, 0x08)
 	writeUint8(p.Conn, 255)
 	writeInt16(p.Conn, sx)
@@ -517,6 +518,66 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CPE BLOCK DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════
+
+type CPEBlock struct {
+	ID             byte
+	Name           string
+	Tex            byte
+	CollideType    byte
+	TransmitsLight byte
+	Sound          byte
+	FullBright     byte
+	Shape          byte
+	Draw           byte
+}
+
+var extraBlocks = []CPEBlock{
+	{50, "Cobblestone Slab", 16, 2, 0, 4, 0, 8, 0},
+	{51, "Rope", 11, 0, 0, 7, 0, 16, 1},
+	{52, "Sandstone", 22, 2, 0, 4, 0, 16, 0},
+	{53, "Snow", 23, 2, 0, 9, 0, 16, 0},
+	{54, "Fire", 24, 0, 1, 0, 1, 16, 1},
+	{55, "Light Pink", 25, 2, 0, 7, 0, 16, 0},
+	{56, "Forest Green", 26, 2, 0, 7, 0, 16, 0},
+	{57, "Brown", 27, 2, 0, 7, 0, 16, 0},
+	{58, "Deep Blue", 28, 2, 0, 7, 0, 16, 0},
+	{59, "Turquoise", 29, 2, 0, 7, 0, 16, 0},
+	{60, "Ice", 30, 2, 0, 6, 0, 16, 3},
+	{61, "Ceramic Tile", 31, 2, 0, 4, 0, 16, 0},
+	{62, "Magma", 32, 2, 0, 4, 1, 16, 0},
+	{63, "Pillar", 33, 2, 0, 4, 0, 16, 0},
+	{64, "Crate", 34, 2, 0, 1, 0, 16, 0},
+	{65, "Stone Brick", 35, 2, 0, 4, 0, 16, 0},
+}
+
+func sendBlockDefinitions(conn net.Conn) {
+	for _, b := range extraBlocks {
+		pkt := make([]byte, 83)
+		pkt[0] = 0x22
+		pkt[1] = b.ID
+		copy(pkt[2:66], padString(b.Name))
+
+		pkt[66] = b.CollideType
+		binary.BigEndian.PutUint32(pkt[67:71], 0x3F800000) // Speed float32 = 1.0
+
+		pkt[71] = b.Tex // Top
+		pkt[72] = b.Tex // Bottom
+		pkt[73] = b.Tex // Side
+
+		pkt[74] = b.TransmitsLight
+		pkt[75] = b.Sound
+		pkt[76] = b.FullBright
+		pkt[77] = b.Shape
+		pkt[78] = b.Draw
+		// 79-82 left as 0 for Fog data
+
+		conn.Write(pkt)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // CONNECTION HANDLER & COMMANDS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -524,9 +585,9 @@ var clientPacketSizes = map[byte]int{
 	0x05: 8,
 	0x08: 9,
 	0x0D: 65,
-	0x10: 66, // ExtInfo (for dynamic handling)
-	0x11: 68, // ExtEntry
-	0x12: 1,  // CustomBlockSupportLevel
+	0x10: 66,
+	0x11: 68,
+	0x12: 1,
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -548,18 +609,29 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
-	// 1. MUST send ServerIdentification BEFORE the CPE handshake!
+	// ALWAYS send ServerIdentification first
 	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
-	// --- Quick Fix CPE Handshake ---
+	// --- CPE Handshake ---
 	clientSupportsCustomBlocks := false
+	clientSupportsBlockDefs := false
+	clientSupportsHeldBlock := false
+
 	if cpe {
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 1) // Only 1 extension now
+		writeInt16(conn, 3) // Announcing 3 extensions
 
 		writeUint8(conn, 0x11)
 		writeString(conn, "CustomBlocks")
+		writeInt32(conn, 1)
+
+		writeUint8(conn, 0x11)
+		writeString(conn, "BlockDefinitions")
+		writeInt32(conn, 1)
+
+		writeUint8(conn, 0x11)
+		writeString(conn, "HeldBlock")
 		writeInt32(conn, 1)
 
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -583,20 +655,24 @@ func handleConnection(conn net.Conn, server *Server) {
 				extEntry := make([]byte, 68)
 				io.ReadFull(conn, extEntry)
 				extName := strings.TrimRight(string(extEntry[0:64]), " ")
+
 				if extName == "CustomBlocks" {
 					clientSupportsCustomBlocks = true
+				} else if extName == "BlockDefinitions" {
+					clientSupportsBlockDefs = true
+				} else if extName == "HeldBlock" {
+					clientSupportsHeldBlock = true
 				}
 				entriesRead++
 			} else {
-				break
+				break // Unrecognized packet, safely end handshake
 			}
 		}
 
 		if clientSupportsCustomBlocks {
 			writeUint8(conn, 0x12)
-			writeUint8(conn, 1) // Level 1
+			writeUint8(conn, 1)
 
-			// Absorb the client's 0x12 reply to prevent it from bleeding into the map chunks
 			pidBuf := make([]byte, 1)
 			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
 				io.ReadFull(conn, make([]byte, 1))
@@ -605,16 +681,19 @@ func handleConnection(conn net.Conn, server *Server) {
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	// Send Server Identification AFTER the handshake is finished
-	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+	// Send Definitions safely after handshake completes
+	if clientSupportsBlockDefs {
+		sendBlockDefinitions(conn)
+	}
 
 	player := &Player{
-		Conn:           conn,
-		Username:       username,
-		Server:         server,
-		Authenticated:  make(map[string]bool),
-		SavedPasswords: make(map[string]string),
-		SupportsCPE:    clientSupportsCustomBlocks,
+		Conn:              conn,
+		Username:          username,
+		Server:            server,
+		Authenticated:     make(map[string]bool),
+		SavedPasswords:    make(map[string]string),
+		SupportsCPE:       clientSupportsCustomBlocks,
+		SupportsHeldBlock: clientSupportsHeldBlock,
 	}
 
 	server.mu.Lock()
@@ -713,7 +792,6 @@ func handleConnection(conn net.Conn, server *Server) {
 			if !cancel && player.World != nil {
 				player.World.SetBlock(int(x), int(y), int(z), block)
 
-				// Broadcast the block update to all players in the same world
 				server.mu.RLock()
 				for _, p2 := range server.players {
 					if p2.World == player.World && p2 != player {
@@ -736,6 +814,32 @@ func handleConnection(conn net.Conn, server *Server) {
 
 		case 0x0D:
 			msg := strings.TrimRight(string(data[1:65]), " ")
+
+			if msg == "/hub" {
+				if w, ok := server.GetWorld("hub"); ok {
+					player.ChangeWorld(w, false)
+				} else {
+					player.SendMessage("&cHub world not found.")
+				}
+				continue
+			}
+
+			if strings.HasPrefix(msg, "/hand ") {
+				idStr := strings.TrimSpace(strings.TrimPrefix(msg, "/hand"))
+				id, err := strconv.Atoi(idStr)
+				if err == nil && id >= 0 && id <= 255 {
+					if player.SupportsHeldBlock {
+						pkt := []byte{0x14, byte(id), 0} // 0 = Allows user to switch away
+						player.Conn.Write(pkt)
+						player.SendMessage(fmt.Sprintf("&aNow holding block %d", id))
+					} else {
+						player.SendMessage("&cYour client doesn't support the HeldBlock extension.")
+					}
+				} else {
+					player.SendMessage("&cUsage: /hand <id> (0-255)")
+				}
+				continue
+			}
 
 			if strings.HasPrefix(msg, "/op ") {
 				password := strings.TrimPrefix(msg, "/op ")
@@ -760,7 +864,7 @@ func handleConnection(conn net.Conn, server *Server) {
 					player.SavedPasswords[pending.Name] = password
 					player.PendingWorld = nil
 					player.mu.Unlock()
-					updatePlayerState(player) // Immediately save logic to JSON
+					updatePlayerState(player)
 					player.SendMessage("&aPassword accepted!")
 					player.ChangeWorld(pending, false)
 				} else {
@@ -1065,7 +1169,6 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 	world.mu.RLock()
 	snapshot := make([]byte, len(world.Blocks))
 
-	// Ensure non-CPE clients don't crash from unsupported >49 IDs
 	if supportsCPE {
 		copy(snapshot, world.Blocks)
 	} else {
@@ -1097,11 +1200,13 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 		chunk := compressed[i:end]
 		progress := byte(i * 100 / total)
 
-		size := chunkSize // Assign to a variable to satisfy the Go compiler
+		size := chunkSize
 		pkt := make([]byte, 0, 1+2+chunkSize+1)
 		pkt = append(pkt, 0x03, byte(size>>8), byte(size))
+
 		padded := make([]byte, chunkSize)
 		copy(padded, chunk)
+
 		pkt = append(pkt, padded...)
 		pkt = append(pkt, progress)
 		conn.Write(pkt)
