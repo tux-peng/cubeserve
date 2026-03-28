@@ -26,6 +26,7 @@ type Config struct {
 	Motd           string
 	Port           string
 	WorldPasswords map[string]string
+	OpPassword     string
 	BannedBlocks   []byte
 }
 
@@ -56,9 +57,10 @@ func loadConfig() {
 
 	f, err := os.Open("server.properties")
 	if err != nil {
-		defaultProps := "ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\npass_world2=letmein\nBannedBlocks=8,9,10,11\n"
+		defaultProps := "ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\npass_world2=letmein\nOpPassword=admin\nBannedBlocks=8,9,10,11\n"
 		os.WriteFile("server.properties", []byte(defaultProps), 0644)
 		serverConfig.WorldPasswords["world2"] = "letmein"
+		serverConfig.OpPassword = "admin"
 		serverConfig.BannedBlocks = []byte{8, 9, 10, 11}
 		return
 	}
@@ -80,6 +82,8 @@ func loadConfig() {
 			serverConfig.Motd = val
 		case "Port":
 			serverConfig.Port = ":" + strings.TrimPrefix(val, ":")
+		case "OpPassword":
+			serverConfig.OpPassword = val
 		case "BannedBlocks":
 			for _, bStr := range strings.Split(val, ",") {
 				if b, err := strconv.Atoi(strings.TrimSpace(bStr)); err == nil {
@@ -96,12 +100,13 @@ func loadConfig() {
 }
 
 type PlayerState struct {
-	World string `json:"world"`
-	X     int16  `json:"x"`
-	Y     int16  `json:"y"`
-	Z     int16  `json:"z"`
-	Yaw   byte   `json:"yaw"`
-	Pitch byte   `json:"pitch"`
+	World          string            `json:"world"`
+	X              int16             `json:"x"`
+	Y              int16             `json:"y"`
+	Z              int16             `json:"z"`
+	Yaw            byte              `json:"yaw"`
+	Pitch          byte              `json:"pitch"`
+	SavedPasswords map[string]string `json:"saved_passwords"`
 }
 
 var (
@@ -127,11 +132,20 @@ func updatePlayerState(p *Player) {
 	if p.World == nil {
 		return
 	}
+
+	p.mu.Lock()
+	savedPws := make(map[string]string)
+	for k, v := range p.SavedPasswords {
+		savedPws[k] = v
+	}
+	p.mu.Unlock()
+
 	dbMutex.Lock()
 	playerDB[p.Username] = PlayerState{
 		World: p.World.Name,
 		X:     p.X, Y: p.Y, Z: p.Z,
 		Yaw: p.Yaw, Pitch: p.Pitch,
+		SavedPasswords: savedPws,
 	}
 	dbMutex.Unlock()
 }
@@ -354,16 +368,18 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 // ═══════════════════════════════════════════════════════════════════
 
 type Player struct {
-	Conn          net.Conn
-	Username      string
-	World         *World
-	Server        *Server
-	X, Y, Z       int16
-	Yaw, Pitch    byte
-	Authenticated map[string]bool
-	PendingWorld  *World
-	SupportsCPE   bool
-	mu            sync.Mutex
+	Conn           net.Conn
+	Username       string
+	World          *World
+	Server         *Server
+	X, Y, Z        int16
+	Yaw, Pitch     byte
+	Authenticated  map[string]bool
+	SavedPasswords map[string]string
+	PendingWorld   *World
+	SupportsCPE    bool
+	IsOp           bool
+	mu             sync.Mutex
 }
 
 func (p *Player) SendMessage(msg string) {
@@ -436,11 +452,17 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.mu.Lock()
 		authed := p.Authenticated[target.Name]
 		if !authed {
-			p.PendingWorld = target
-			p.mu.Unlock()
-			p.SendMessage("&eThis world requires a password.")
-			p.SendMessage("&eType /pass <password> to enter.")
-			return
+			// Auto-authenticate if we have a matching saved password
+			if savedPw, ok := p.SavedPasswords[target.Name]; ok && savedPw == pw {
+				p.Authenticated[target.Name] = true
+				authed = true
+			} else {
+				p.PendingWorld = target
+				p.mu.Unlock()
+				p.SendMessage("&eThis world requires a password.")
+				p.SendMessage("&eType /pass <password> to enter.")
+				return
+			}
 		}
 		p.mu.Unlock()
 	}
@@ -534,10 +556,14 @@ func handleConnection(conn net.Conn, server *Server) {
 	if cpe {
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 1)
+		writeInt16(conn, 2) // We support 2 extensions now
 
 		writeUint8(conn, 0x11)
 		writeString(conn, "CustomBlocks")
+		writeInt32(conn, 1)
+
+		writeUint8(conn, 0x11)
+		writeString(conn, "BlockDefinitions") // Core CPE Block Definitions support
 		writeInt32(conn, 1)
 
 		// 5-second timeout to prevent malicious/bugged clients from stalling the server
@@ -582,12 +608,6 @@ func handleConnection(conn net.Conn, server *Server) {
 		if clientSupportsCustomBlocks {
 			writeUint8(conn, 0x12)
 			writeUint8(conn, 1) // Level 1
-
-			// Await client's 0x12 acknowledgement safely
-			//pidBuf := make([]byte, 1)
-			//if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
-			//	io.ReadFull(conn, make([]byte, 1)) // Consume the payload
-			//}
 		}
 
 		// Clear the timeout for normal gameplay
@@ -595,11 +615,12 @@ func handleConnection(conn net.Conn, server *Server) {
 	}
 
 	player := &Player{
-		Conn:          conn,
-		Username:      username,
-		Server:        server,
-		Authenticated: make(map[string]bool),
-		SupportsCPE:   clientSupportsCustomBlocks,
+		Conn:           conn,
+		Username:       username,
+		Server:         server,
+		Authenticated:  make(map[string]bool),
+		SavedPasswords: make(map[string]string),
+		SupportsCPE:    clientSupportsCustomBlocks,
 	}
 
 	server.mu.Lock()
@@ -623,6 +644,11 @@ func handleConnection(conn net.Conn, server *Server) {
 
 	worldSet := false
 	if hasSavedState {
+		if savedState.SavedPasswords != nil {
+			for k, v := range savedState.SavedPasswords {
+				player.SavedPasswords[k] = v
+			}
+		}
 		if w, ok := server.GetWorld(savedState.World); ok {
 			player.X, player.Y, player.Z = savedState.X, savedState.Y, savedState.Z
 			player.Yaw, player.Pitch = savedState.Yaw, savedState.Pitch
@@ -717,6 +743,17 @@ func handleConnection(conn net.Conn, server *Server) {
 		case 0x0D:
 			msg := strings.TrimRight(string(data[1:65]), " ")
 
+			if strings.HasPrefix(msg, "/op ") {
+				password := strings.TrimPrefix(msg, "/op ")
+				if serverConfig.OpPassword != "" && password == serverConfig.OpPassword {
+					player.IsOp = true
+					player.SendMessage("&aYou are now a server operator.")
+				} else {
+					player.SendMessage("&cIncorrect operator password.")
+				}
+				continue
+			}
+
 			if strings.HasPrefix(msg, "/pass ") {
 				password := strings.TrimPrefix(msg, "/pass ")
 				player.mu.Lock()
@@ -726,8 +763,10 @@ func handleConnection(conn net.Conn, server *Server) {
 				if pending != nil && serverConfig.WorldPasswords[pending.Name] == password {
 					player.mu.Lock()
 					player.Authenticated[pending.Name] = true
+					player.SavedPasswords[pending.Name] = password
 					player.PendingWorld = nil
 					player.mu.Unlock()
+					updatePlayerState(player) // Immediately save logic to JSON
 					player.SendMessage("&aPassword accepted!")
 					player.ChangeWorld(pending, false)
 				} else {
@@ -747,6 +786,10 @@ func handleConnection(conn net.Conn, server *Server) {
 			}
 
 			if strings.HasPrefix(msg, "/newlvl ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be a server op to use this command.")
+					continue
+				}
 				parts := strings.Split(msg, " ")
 				if len(parts) == 5 {
 					name := parts[1]
@@ -765,6 +808,10 @@ func handleConnection(conn net.Conn, server *Server) {
 			}
 
 			if strings.HasPrefix(msg, "/resizelvl ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be a server op to use this command.")
+					continue
+				}
 				parts := strings.Split(msg, " ")
 				if len(parts) == 4 && player.World != nil {
 					newW, _ := strconv.Atoi(parts[1])
