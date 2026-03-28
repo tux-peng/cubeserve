@@ -494,9 +494,8 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.Yaw, p.Pitch = syaw, spitch
 	}
 
-	writeUint8(p.Conn, 0x07)
+	writeUint8(p.Conn, 0x08)
 	writeUint8(p.Conn, 255)
-	writeString(p.Conn, p.Username)
 	writeInt16(p.Conn, sx)
 	writeInt16(p.Conn, sy)
 	writeInt16(p.Conn, sz)
@@ -549,30 +548,24 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
+	// 1. MUST send ServerIdentification BEFORE the CPE handshake!
 	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
-	// --- Robust CPE Handshake ---
+	// --- Quick Fix CPE Handshake ---
 	clientSupportsCustomBlocks := false
 	if cpe {
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 2) // We support 2 extensions now
+		writeInt16(conn, 1) // Only 1 extension now
 
 		writeUint8(conn, 0x11)
 		writeString(conn, "CustomBlocks")
 		writeInt32(conn, 1)
 
-		writeUint8(conn, 0x11)
-		writeString(conn, "BlockDefinitions") // Core CPE Block Definitions support
-		writeInt32(conn, 1)
-
-		// 5-second timeout to prevent malicious/bugged clients from stalling the server
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
 		expectedEntries := -1
 		entriesRead := 0
 
-		// Dynamic packet loop for handshake
 		for expectedEntries == -1 || entriesRead < expectedEntries {
 			pidBuf := make([]byte, 1)
 			if _, err := io.ReadFull(conn, pidBuf); err != nil {
@@ -584,7 +577,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				io.ReadFull(conn, extInfo)
 				expectedEntries = int(binary.BigEndian.Uint16(extInfo[64:66]))
 				if expectedEntries == 0 {
-					break // Client sent ExtInfo but has 0 extensions
+					break
 				}
 			} else if pidBuf[0] == 0x11 {
 				extEntry := make([]byte, 68)
@@ -595,24 +588,25 @@ func handleConnection(conn net.Conn, server *Server) {
 				}
 				entriesRead++
 			} else {
-				// Unexpected packet during handshake, safely consume it if known
-				size, known := clientPacketSizes[pidBuf[0]]
-				if known {
-					io.ReadFull(conn, make([]byte, size))
-				} else {
-					break // Unknown packet, abort handshake to prevent byte stream desync
-				}
+				break
 			}
 		}
 
 		if clientSupportsCustomBlocks {
 			writeUint8(conn, 0x12)
 			writeUint8(conn, 1) // Level 1
-		}
 
-		// Clear the timeout for normal gameplay
+			// Absorb the client's 0x12 reply to prevent it from bleeding into the map chunks
+			pidBuf := make([]byte, 1)
+			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
+				io.ReadFull(conn, make([]byte, 1))
+			}
+		}
 		conn.SetReadDeadline(time.Time{})
 	}
+
+	// Send Server Identification AFTER the handshake is finished
+	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
 	player := &Player{
 		Conn:           conn,
@@ -1103,8 +1097,9 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 		chunk := compressed[i:end]
 		progress := byte(i * 100 / total)
 
+		size := chunkSize // Assign to a variable to satisfy the Go compiler
 		pkt := make([]byte, 0, 1+2+chunkSize+1)
-		pkt = append(pkt, 0x03, byte(len(chunk)>>8), byte(len(chunk)))
+		pkt = append(pkt, 0x03, byte(size>>8), byte(size))
 		padded := make([]byte, chunkSize)
 		copy(padded, chunk)
 		pkt = append(pkt, padded...)
