@@ -554,7 +554,8 @@ var extraBlocks = []CPEBlock{
 
 func sendBlockDefinitions(conn net.Conn) {
 	for _, b := range extraBlocks {
-		pkt := make([]byte, 83)
+		// DefineBlock packet MUST be exactly 86 bytes
+		pkt := make([]byte, 86)
 		pkt[0] = 0x22
 		pkt[1] = b.ID
 		copy(pkt[2:66], padString(b.Name))
@@ -562,16 +563,20 @@ func sendBlockDefinitions(conn net.Conn) {
 		pkt[66] = b.CollideType
 		binary.BigEndian.PutUint32(pkt[67:71], 0x3F800000) // Speed float32 = 1.0
 
+		// All 6 faces must be explicitly defined
 		pkt[71] = b.Tex // Top
 		pkt[72] = b.Tex // Bottom
-		pkt[73] = b.Tex // Side
+		pkt[73] = b.Tex // Front
+		pkt[74] = b.Tex // Back
+		pkt[75] = b.Tex // Left
+		pkt[76] = b.Tex // Right
 
-		pkt[74] = b.TransmitsLight
-		pkt[75] = b.Sound
-		pkt[76] = b.FullBright
-		pkt[77] = b.Shape
-		pkt[78] = b.Draw
-		// 79-82 left as 0 for Fog data
+		pkt[77] = b.TransmitsLight
+		pkt[78] = b.Sound
+		pkt[79] = b.FullBright
+		pkt[80] = b.Shape
+		pkt[81] = b.Draw
+		// 82-85 are left as 0 for Fog data
 
 		conn.Write(pkt)
 	}
@@ -587,7 +592,7 @@ var clientPacketSizes = map[byte]int{
 	0x0D: 65,
 	0x10: 66,
 	0x11: 68,
-	0x13: 1, // <--- CHANGED FROM 0x12 to 0x13
+	0x12: 1, // CustomBlocks Support Level
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -609,10 +614,10 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
-	// ALWAYS send ServerIdentification first
-	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+	// 1. MUST BE AT THE TOP to prevent the 111 stream offset
+	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
-	// --- CPE Handshake ---
+	// --- Standardized CPE Handshake ---
 	clientSupportsCustomBlocks := false
 	clientSupportsBlockDefs := false
 	clientSupportsHeldBlock := false
@@ -620,7 +625,7 @@ func handleConnection(conn net.Conn, server *Server) {
 	if cpe {
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 3) // Announcing 3 extensions
+		writeInt16(conn, 3)
 
 		writeUint8(conn, 0x11)
 		writeString(conn, "CustomBlocks")
@@ -665,12 +670,16 @@ func handleConnection(conn net.Conn, server *Server) {
 				}
 				entriesRead++
 			} else {
-				break // Unrecognized packet, safely end handshake
+				if size, known := clientPacketSizes[pidBuf[0]]; known {
+					io.ReadFull(conn, make([]byte, size))
+				} else {
+					break
+				}
 			}
 		}
 
 		if clientSupportsCustomBlocks {
-			writeUint8(conn, 0x13) // <--- CHANGED FROM 0x12
+			writeUint8(conn, 0x12)
 			writeUint8(conn, 1)
 
 			pidBuf := make([]byte, 1)
@@ -681,10 +690,7 @@ func handleConnection(conn net.Conn, server *Server) {
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	// 1. ✅ ALWAYS send ServerIdentification AFTER the CPE Handshake completes
-	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
-
-	// 2. ✅ Send Block Definitions SAFELY AFTER ServerIdentification
+	// 2. Sent safely AFTER handshake
 	if clientSupportsBlockDefs {
 		sendBlockDefinitions(conn)
 	}
