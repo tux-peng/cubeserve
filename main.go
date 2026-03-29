@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,6 +34,36 @@ type Config struct {
 
 var serverConfig Config
 
+func hashPassword(password string) string {
+	hash := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(hash[:])
+}
+
+func saveConfig() {
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("ServerName=%s\n", serverConfig.ServerName))
+	buf.WriteString(fmt.Sprintf("Motd=%s\n", serverConfig.Motd))
+	buf.WriteString(fmt.Sprintf("Port=%s\n", strings.TrimPrefix(serverConfig.Port, ":")))
+
+	if serverConfig.OpPassword != "" {
+		buf.WriteString(fmt.Sprintf("OpPassword=%s\n", serverConfig.OpPassword))
+	}
+
+	if len(serverConfig.BannedBlocks) > 0 {
+		var strBlocks []string
+		for _, b := range serverConfig.BannedBlocks {
+			strBlocks = append(strBlocks, strconv.Itoa(int(b)))
+		}
+		buf.WriteString(fmt.Sprintf("BannedBlocks=%s\n", strings.Join(strBlocks, ",")))
+	}
+
+	for world, passHash := range serverConfig.WorldPasswords {
+		buf.WriteString(fmt.Sprintf("pass_%s=%s\n", world, passHash))
+	}
+
+	os.WriteFile("server.properties", buf.Bytes(), 0644)
+}
+
 func savePortals(portals []Portal, path string) {
 	data, _ := json.MarshalIndent(portals, "", "  ")
 	os.WriteFile(path, data, 0644)
@@ -57,10 +89,13 @@ func loadConfig() {
 
 	f, err := os.Open("server.properties")
 	if err != nil {
-		defaultProps := "ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\npass_world2=letmein\nOpPassword=admin\nBannedBlocks=8,9,10,11\n"
+		defaultWorldHash := hashPassword("letmein")
+		defaultOpHash := hashPassword("admin")
+
+		defaultProps := fmt.Sprintf("ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\npass_world2=%s\nOpPassword=%s\nBannedBlocks=8,9,10,11\n", defaultWorldHash, defaultOpHash)
 		os.WriteFile("server.properties", []byte(defaultProps), 0644)
-		serverConfig.WorldPasswords["world2"] = "letmein"
-		serverConfig.OpPassword = "admin"
+		serverConfig.WorldPasswords["world2"] = defaultWorldHash
+		serverConfig.OpPassword = defaultOpHash
 		serverConfig.BannedBlocks = []byte{8, 9, 10, 11}
 		return
 	}
@@ -368,19 +403,18 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 // ═══════════════════════════════════════════════════════════════════
 
 type Player struct {
-	Conn              net.Conn
-	Username          string
-	World             *World
-	Server            *Server
-	X, Y, Z           int16
-	Yaw, Pitch        byte
-	Authenticated     map[string]bool
-	SavedPasswords    map[string]string
-	PendingWorld      *World
-	SupportsCPE       bool
-	SupportsHeldBlock bool
-	IsOp              bool
-	mu                sync.Mutex
+	Conn           net.Conn
+	Username       string
+	World          *World
+	Server         *Server
+	X, Y, Z        int16
+	Yaw, Pitch     byte
+	Authenticated  map[string]bool
+	SavedPasswords map[string]string
+	PendingWorld   *World
+	SupportsCPE    bool
+	IsOp           bool
+	mu             sync.Mutex
 }
 
 func (p *Player) SendMessage(msg string) {
@@ -391,7 +425,7 @@ func (p *Player) SendMessage(msg string) {
 	p.Conn.Write(pkt)
 }
 
-// Fallback mechanism for Vanilla Classic Clients
+// Blocks 50-65 Fallback mechanism for Vanilla Classic Clients
 func getFallbackBlock(b byte) byte {
 	switch b {
 	case 50:
@@ -428,7 +462,7 @@ func getFallbackBlock(b byte) byte {
 		return 1 // Stone Brick -> Stone
 	default:
 		if b > 49 {
-			return 1
+			return 1 // Stone fallback for undefined
 		}
 		return b
 	}
@@ -453,6 +487,7 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.mu.Lock()
 		authed := p.Authenticated[target.Name]
 		if !authed {
+			// Auto-authenticate if we have a matching saved password
 			if savedPw, ok := p.SavedPasswords[target.Name]; ok && savedPw == pw {
 				p.Authenticated[target.Name] = true
 				authed = true
@@ -494,7 +529,6 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.Yaw, p.Pitch = syaw, spitch
 	}
 
-	// 0x08 is used for teleporting/spawning the local player correctly.
 	writeUint8(p.Conn, 0x08)
 	writeUint8(p.Conn, 255)
 	writeInt16(p.Conn, sx)
@@ -518,70 +552,6 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// CPE BLOCK DEFINITIONS
-// ═══════════════════════════════════════════════════════════════════
-
-type CPEBlock struct {
-	ID             byte
-	Name           string
-	Tex            byte
-	CollideType    byte
-	TransmitsLight byte
-	Sound          byte
-	FullBright     byte
-	Shape          byte
-	Draw           byte
-}
-
-var extraBlocks = []CPEBlock{
-	{50, "Cobblestone Slab", 16, 2, 0, 4, 0, 8, 0},
-	{51, "Rope", 11, 0, 0, 7, 0, 16, 1},
-	{52, "Sandstone", 22, 2, 0, 4, 0, 16, 0},
-	{53, "Snow", 23, 2, 0, 9, 0, 16, 0},
-	{54, "Fire", 24, 0, 1, 0, 1, 16, 1},
-	{55, "Light Pink", 25, 2, 0, 7, 0, 16, 0},
-	{56, "Forest Green", 26, 2, 0, 7, 0, 16, 0},
-	{57, "Brown", 27, 2, 0, 7, 0, 16, 0},
-	{58, "Deep Blue", 28, 2, 0, 7, 0, 16, 0},
-	{59, "Turquoise", 29, 2, 0, 7, 0, 16, 0},
-	{60, "Ice", 30, 2, 0, 6, 0, 16, 3},
-	{61, "Ceramic Tile", 31, 2, 0, 4, 0, 16, 0},
-	{62, "Magma", 32, 2, 0, 4, 1, 16, 0},
-	{63, "Pillar", 33, 2, 0, 4, 0, 16, 0},
-	{64, "Crate", 34, 2, 0, 1, 0, 16, 0},
-	{65, "Stone Brick", 35, 2, 0, 4, 0, 16, 0},
-}
-
-func sendBlockDefinitions(conn net.Conn) {
-	for _, b := range extraBlocks {
-		// DefineBlock packet MUST be exactly 86 bytes
-		pkt := make([]byte, 86)
-		pkt[0] = 0x22
-		pkt[1] = b.ID
-		copy(pkt[2:66], padString(b.Name))
-
-		pkt[66] = b.CollideType
-		binary.BigEndian.PutUint32(pkt[67:71], 0x3F800000) // Speed float32 = 1.0
-
-		pkt[71] = b.Tex // Top
-		pkt[72] = b.Tex // Bottom
-		pkt[73] = b.Tex // Front
-		pkt[74] = b.Tex // Back
-		pkt[75] = b.Tex // Left
-		pkt[76] = b.Tex // Right
-
-		pkt[77] = b.TransmitsLight
-		pkt[78] = b.Sound
-		pkt[79] = b.FullBright
-		pkt[80] = b.Shape
-		pkt[81] = b.Draw
-		// 82-85 are safely left as 0x00 for Fog data
-
-		conn.Write(pkt)
-	}
-}
-
-// ═══════════════════════════════════════════════════════════════════
 // CONNECTION HANDLER & COMMANDS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -589,9 +559,9 @@ var clientPacketSizes = map[byte]int{
 	0x05: 8,
 	0x08: 9,
 	0x0D: 65,
-	0x10: 66,
-	0x11: 68,
-	0x13: 1, // CustomBlocks Support Level negotiation MUST be 0x13
+	0x10: 66, // ExtInfo (for dynamic handling)
+	0x11: 68, // ExtEntry
+	0x12: 1,  // CustomBlockSupportLevel
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -613,34 +583,24 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
-	// --- Standardized CPE Handshake ---
-	clientSupportsCustomBlocks := false
-	clientSupportsBlockDefs := false
-	clientSupportsHeldBlock := false
+	// 1. MUST send ServerIdentification BEFORE the CPE handshake!
+	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
+	// --- Quick Fix CPE Handshake ---
+	clientSupportsCustomBlocks := false
 	if cpe {
-		// Announce Server Extensions
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 3)
+		writeInt16(conn, 1) // Only 1 extension now
 
 		writeUint8(conn, 0x11)
 		writeString(conn, "CustomBlocks")
-		writeInt32(conn, 1)
-
-		writeUint8(conn, 0x11)
-		writeString(conn, "BlockDefinitions")
-		writeInt32(conn, 1)
-
-		writeUint8(conn, 0x11)
-		writeString(conn, "HeldBlock")
 		writeInt32(conn, 1)
 
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		expectedEntries := -1
 		entriesRead := 0
 
-		// Read Client Extensions
 		for expectedEntries == -1 || entriesRead < expectedEntries {
 			pidBuf := make([]byte, 1)
 			if _, err := io.ReadFull(conn, pidBuf); err != nil {
@@ -658,54 +618,38 @@ func handleConnection(conn net.Conn, server *Server) {
 				extEntry := make([]byte, 68)
 				io.ReadFull(conn, extEntry)
 				extName := strings.TrimRight(string(extEntry[0:64]), " ")
-
 				if extName == "CustomBlocks" {
 					clientSupportsCustomBlocks = true
-				} else if extName == "BlockDefinitions" {
-					clientSupportsBlockDefs = true
-				} else if extName == "HeldBlock" {
-					clientSupportsHeldBlock = true
 				}
 				entriesRead++
 			} else {
-				if size, known := clientPacketSizes[pidBuf[0]]; known {
-					io.ReadFull(conn, make([]byte, size))
-				} else {
-					break
-				}
+				break
 			}
 		}
 
-		// Negotiate Custom Blocks Support Level using 0x13
 		if clientSupportsCustomBlocks {
-			writeUint8(conn, 0x13)
-			writeUint8(conn, 1)
+			writeUint8(conn, 0x12)
+			writeUint8(conn, 1) // Level 1
 
+			// Absorb the client's 0x12 reply to prevent it from bleeding into the map chunks
 			pidBuf := make([]byte, 1)
-			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x13 {
+			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
 				io.ReadFull(conn, make([]byte, 1))
 			}
 		}
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	// 1. Send ServerIdentification AFTER the handshake
-	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+	// Send Server Identification AFTER the handshake is finished
+	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
-	// 2. Send Block Definitions AFTER ServerIdentification
-	if clientSupportsBlockDefs {
-		sendBlockDefinitions(conn)
-	}
-
-	// --- Standard Player Initialization ---
 	player := &Player{
-		Conn:              conn,
-		Username:          username,
-		Server:            server,
-		Authenticated:     make(map[string]bool),
-		SavedPasswords:    make(map[string]string),
-		SupportsCPE:       clientSupportsCustomBlocks,
-		SupportsHeldBlock: clientSupportsHeldBlock,
+		Conn:           conn,
+		Username:       username,
+		Server:         server,
+		Authenticated:  make(map[string]bool),
+		SavedPasswords: make(map[string]string),
+		SupportsCPE:    clientSupportsCustomBlocks,
 	}
 
 	server.mu.Lock()
@@ -748,7 +692,6 @@ func handleConnection(conn net.Conn, server *Server) {
 		}
 	}
 
-	// --- Main Packet Loop ---
 	idBuf := make([]byte, 1)
 	for {
 		if _, err := io.ReadFull(conn, idBuf); err != nil {
@@ -805,6 +748,7 @@ func handleConnection(conn net.Conn, server *Server) {
 			if !cancel && player.World != nil {
 				player.World.SetBlock(int(x), int(y), int(z), block)
 
+				// Broadcast the block update to all players in the same world
 				server.mu.RLock()
 				for _, p2 := range server.players {
 					if p2.World == player.World && p2 != player {
@@ -828,35 +772,9 @@ func handleConnection(conn net.Conn, server *Server) {
 		case 0x0D:
 			msg := strings.TrimRight(string(data[1:65]), " ")
 
-			if msg == "/hub" {
-				if w, ok := server.GetWorld("hub"); ok {
-					player.ChangeWorld(w, false)
-				} else {
-					player.SendMessage("&cHub world not found.")
-				}
-				continue
-			}
-
-			if strings.HasPrefix(msg, "/hand ") {
-				idStr := strings.TrimSpace(strings.TrimPrefix(msg, "/hand"))
-				id, err := strconv.Atoi(idStr)
-				if err == nil && id >= 0 && id <= 255 {
-					if player.SupportsHeldBlock {
-						pkt := []byte{0x14, byte(id), 0} // 0 = Allows user to switch away
-						player.Conn.Write(pkt)
-						player.SendMessage(fmt.Sprintf("&aNow holding block %d", id))
-					} else {
-						player.SendMessage("&cYour client doesn't support the HeldBlock extension.")
-					}
-				} else {
-					player.SendMessage("&cUsage: /hand <id> (0-255)")
-				}
-				continue
-			}
-
 			if strings.HasPrefix(msg, "/op ") {
 				password := strings.TrimPrefix(msg, "/op ")
-				if serverConfig.OpPassword != "" && password == serverConfig.OpPassword {
+				if serverConfig.OpPassword != "" && hashPassword(password) == serverConfig.OpPassword {
 					player.IsOp = true
 					player.SendMessage("&aYou are now a server operator.")
 				} else {
@@ -871,17 +789,38 @@ func handleConnection(conn net.Conn, server *Server) {
 				pending := player.PendingWorld
 				player.mu.Unlock()
 
-				if pending != nil && serverConfig.WorldPasswords[pending.Name] == password {
+				if pending != nil && serverConfig.WorldPasswords[pending.Name] == hashPassword(password) {
 					player.mu.Lock()
 					player.Authenticated[pending.Name] = true
-					player.SavedPasswords[pending.Name] = password
+					player.SavedPasswords[pending.Name] = hashPassword(password)
 					player.PendingWorld = nil
 					player.mu.Unlock()
-					updatePlayerState(player)
+					updatePlayerState(player) // Immediately save logic to JSON
 					player.SendMessage("&aPassword accepted!")
 					player.ChangeWorld(pending, false)
 				} else {
 					player.SendMessage("&cIncorrect password or no world pending.")
+				}
+				continue
+			}
+
+			if strings.HasPrefix(msg, "/set ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /set.")
+					continue
+				}
+				parts := strings.Split(msg, " ")
+				if len(parts) >= 3 && parts[1] == "op" {
+					serverConfig.OpPassword = hashPassword(parts[2])
+					saveConfig()
+					player.SendMessage("&eOperator password securely updated.")
+				} else if len(parts) >= 4 && parts[1] == "world" {
+					worldName := parts[2]
+					serverConfig.WorldPasswords[worldName] = hashPassword(parts[3])
+					saveConfig()
+					player.SendMessage(fmt.Sprintf("&ePassword for world '%s' securely updated.", worldName))
+				} else {
+					player.SendMessage("&cUsage: /set op <pass> OR /set world <name> <pass>")
 				}
 				continue
 			}
@@ -1182,6 +1121,7 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 	world.mu.RLock()
 	snapshot := make([]byte, len(world.Blocks))
 
+	// Ensure non-CPE clients don't crash from unsupported >49 IDs
 	if supportsCPE {
 		copy(snapshot, world.Blocks)
 	} else {
@@ -1213,13 +1153,11 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 		chunk := compressed[i:end]
 		progress := byte(i * 100 / total)
 
-		size := chunkSize
+		size := chunkSize // Assign to a variable to satisfy the Go compiler
 		pkt := make([]byte, 0, 1+2+chunkSize+1)
 		pkt = append(pkt, 0x03, byte(size>>8), byte(size))
-
 		padded := make([]byte, chunkSize)
 		copy(padded, chunk)
-
 		pkt = append(pkt, padded...)
 		pkt = append(pkt, progress)
 		conn.Write(pkt)
