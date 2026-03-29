@@ -563,7 +563,6 @@ func sendBlockDefinitions(conn net.Conn) {
 		pkt[66] = b.CollideType
 		binary.BigEndian.PutUint32(pkt[67:71], 0x3F800000) // Speed float32 = 1.0
 
-		// All 6 faces must be explicitly defined
 		pkt[71] = b.Tex // Top
 		pkt[72] = b.Tex // Bottom
 		pkt[73] = b.Tex // Front
@@ -576,7 +575,7 @@ func sendBlockDefinitions(conn net.Conn) {
 		pkt[79] = b.FullBright
 		pkt[80] = b.Shape
 		pkt[81] = b.Draw
-		// 82-85 are left as 0 for Fog data
+		// 82-85 are safely left as 0x00 for Fog data
 
 		conn.Write(pkt)
 	}
@@ -592,7 +591,7 @@ var clientPacketSizes = map[byte]int{
 	0x0D: 65,
 	0x10: 66,
 	0x11: 68,
-	0x12: 1, // CustomBlocks Support Level
+	0x13: 1, // CustomBlocks Support Level negotiation MUST be 0x13
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -614,15 +613,13 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
-	// 1. MUST BE AT THE TOP to prevent the 111 stream offset
-	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
-
 	// --- Standardized CPE Handshake ---
 	clientSupportsCustomBlocks := false
 	clientSupportsBlockDefs := false
 	clientSupportsHeldBlock := false
 
 	if cpe {
+		// Announce Server Extensions
 		writeUint8(conn, 0x10)
 		writeString(conn, serverConfig.ServerName)
 		writeInt16(conn, 3)
@@ -643,6 +640,7 @@ func handleConnection(conn net.Conn, server *Server) {
 		expectedEntries := -1
 		entriesRead := 0
 
+		// Read Client Extensions
 		for expectedEntries == -1 || entriesRead < expectedEntries {
 			pidBuf := make([]byte, 1)
 			if _, err := io.ReadFull(conn, pidBuf); err != nil {
@@ -678,23 +676,28 @@ func handleConnection(conn net.Conn, server *Server) {
 			}
 		}
 
+		// Negotiate Custom Blocks Support Level using 0x13
 		if clientSupportsCustomBlocks {
-			writeUint8(conn, 0x12)
+			writeUint8(conn, 0x13)
 			writeUint8(conn, 1)
 
 			pidBuf := make([]byte, 1)
-			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
+			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x13 {
 				io.ReadFull(conn, make([]byte, 1))
 			}
 		}
 		conn.SetReadDeadline(time.Time{})
 	}
 
-	// 2. Sent safely AFTER handshake
+	// 1. Send ServerIdentification AFTER the handshake
+	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
+
+	// 2. Send Block Definitions AFTER ServerIdentification
 	if clientSupportsBlockDefs {
 		sendBlockDefinitions(conn)
 	}
 
+	// --- Standard Player Initialization ---
 	player := &Player{
 		Conn:              conn,
 		Username:          username,
@@ -745,6 +748,7 @@ func handleConnection(conn net.Conn, server *Server) {
 		}
 	}
 
+	// --- Main Packet Loop ---
 	idBuf := make([]byte, 1)
 	for {
 		if _, err := io.ReadFull(conn, idBuf); err != nil {
