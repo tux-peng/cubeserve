@@ -96,7 +96,7 @@ func loadConfig() {
 		os.WriteFile("server.properties", []byte(defaultProps), 0644)
 		serverConfig.WorldPasswords["world2"] = defaultWorldHash
 		serverConfig.OpPassword = defaultOpHash
-		serverConfig.BannedBlocks = []byte{8, 9, 10, 11}
+		serverConfig.BannedBlocks = []byte{8, 9, 10, 11, 54}
 		return
 	}
 	defer f.Close()
@@ -133,6 +133,297 @@ func loadConfig() {
 		}
 	}
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// CUSTOM BLOCK DEFINITIONS  (CPE BlockDefinitions)
+// ═══════════════════════════════════════════════════════════════════
+
+// CustomBlock holds every property the CPE DefineBlock packet carries.
+// Persisted to customblocks.json and sent to BlockDefinitions-capable clients.
+type CustomBlock struct {
+	ID            byte   `json:"id"`
+	Name          string `json:"name"`
+	Solidity      byte   `json:"solidity"`       // 0=walk-through  1=swim-through  2=solid
+	Speed         byte   `json:"speed"`          // 1..8  (4 = normal 1.0x)
+	TopTex        byte   `json:"top_tex"`        // texture-atlas index
+	SideTex       byte   `json:"side_tex"`       // texture-atlas index (all 4 sides)
+	BottomTex     byte   `json:"bottom_tex"`     // texture-atlas index
+	TransmitLight byte   `json:"transmit_light"` // 0 or 1
+	WalkSound     byte   `json:"walk_sound"`     // 0=none 1=wood 2=gravel 3=grass 4=stone 5=metal 6=glass 7=wool 8=sand 9=snow
+	FullBright    byte   `json:"full_bright"`    // 0 or 1
+	Shape         byte   `json:"shape"`          // 0=sprite  1-16=height in sixteenths
+	BlockDraw     byte   `json:"block_draw"`     // 0=opaque 1=transparent(same) 2=transparent(diff) 3=translucent 4=gas
+	FogDensity    byte   `json:"fog_density"`
+	FogR          byte   `json:"fog_r"`
+	FogG          byte   `json:"fog_g"`
+	FogB          byte   `json:"fog_b"`
+	Fallback      byte   `json:"fallback"` // vanilla block ID for non-CPE clients (0-49)
+}
+
+var (
+	customBlocks   = make(map[byte]CustomBlock) // key = block ID
+	customBlocksMu sync.RWMutex
+)
+
+func loadCustomBlocks() {
+	data, err := os.ReadFile("customblocks.json")
+	if err != nil {
+		return
+	}
+
+	// Strip UTF-8 BOM if present (common when editing with Notepad on Windows)
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		data = data[3:]
+	}
+
+	var list []CustomBlock
+	if err := json.Unmarshal(data, &list); err != nil {
+		log.Printf("[Blocks] ERROR parsing customblocks.json: %v", err)
+		log.Printf("[Blocks] No custom blocks loaded — fix the JSON and restart.")
+		return
+	}
+
+	customBlocksMu.Lock()
+	for _, cb := range list {
+		if cb.ID < 50 {
+			log.Printf("[Blocks] WARNING: skipping block %d (%q) — ID must be 50-255", cb.ID, cb.Name)
+			continue
+		}
+		cb = clampBlockProperties(cb)
+		customBlocks[cb.ID] = cb
+		log.Printf("[Blocks] Loaded block %d: %q (tex %d/%d/%d, fb %d)",
+			cb.ID, cb.Name, cb.TopTex, cb.SideTex, cb.BottomTex, cb.Fallback)
+	}
+	customBlocksMu.Unlock()
+}
+
+// clampBlockProperties forces every field into its valid range so a
+// hand-edited JSON file can never produce a broken DefineBlock packet.
+func clampBlockProperties(cb CustomBlock) CustomBlock {
+	if cb.Solidity > 2 {
+		cb.Solidity = 2
+	}
+	if cb.Speed < 1 || cb.Speed > 8 {
+		cb.Speed = 4
+	}
+	if cb.TransmitLight > 1 {
+		cb.TransmitLight = 0
+	}
+	if cb.WalkSound > 9 {
+		cb.WalkSound = 0
+	}
+	if cb.FullBright > 1 {
+		cb.FullBright = 0
+	}
+	if cb.Shape > 16 {
+		cb.Shape = 16
+	}
+	if cb.BlockDraw > 4 {
+		cb.BlockDraw = 0
+	}
+	if cb.Fallback > 49 {
+		cb.Fallback = 1
+	}
+	if len(cb.Name) > 64 {
+		cb.Name = cb.Name[:64]
+	}
+	return cb
+}
+
+// ── MCGalaxy global.json import ──────────────────────────────────
+
+// mcgBlockDef mirrors the JSON layout MCGalaxy uses in global.json.
+type mcgBlockDef struct {
+	BlockID     int    `json:"BlockID"`
+	Name        string `json:"Name"`
+	Speed       int    `json:"Speed"`
+	CollideType int    `json:"CollideType"`
+	TopTex      int    `json:"TopTex"`
+	BottomTex   int    `json:"BottomTex"`
+	LeftTex     int    `json:"LeftTex"`
+	RightTex    int    `json:"RightTex"`
+	FrontTex    int    `json:"FrontTex"`
+	BackTex     int    `json:"BackTex"`
+	BlocksLight bool   `json:"BlocksLight"`
+	WalkSound   int    `json:"WalkSound"`
+	FullBright  bool   `json:"FullBright"`
+	Shape       int    `json:"Shape"`
+	BlockDraw   int    `json:"BlockDraw"`
+	FallBack    int    `json:"FallBack"`
+	FogDensity  int    `json:"FogDensity"`
+	FogR        int    `json:"FogR"`
+	FogG        int    `json:"FogG"`
+	FogB        int    `json:"FogB"`
+	MinX        int    `json:"MinX"`
+	MinY        int    `json:"MinY"`
+	MinZ        int    `json:"MinZ"`
+	MaxX        int    `json:"MaxX"`
+	MaxY        int    `json:"MaxY"`
+	MaxZ        int    `json:"MaxZ"`
+}
+
+// mcgToCustomBlock converts an MCGalaxy block definition into our format.
+func mcgToCustomBlock(m mcgBlockDef) CustomBlock {
+	// MCGalaxy stores per-face side textures; DefineBlock (0x23) has one
+	// SideTex field, so pick LeftTex (they're usually all the same).
+	sideTex := byte(m.LeftTex)
+
+	// MCGalaxy: BlocksLight=true means the block BLOCKS light → TransmitLight=0
+	transmit := byte(0)
+	if !m.BlocksLight {
+		transmit = 1
+	}
+
+	bright := byte(0)
+	if m.FullBright {
+		bright = 1
+	}
+
+	// MCGalaxy Speed is the raw CPE byte (1-8).
+	// A value of 0 in their JSON means "default" → treat as 4 (1.0×).
+	speed := byte(m.Speed)
+	if speed == 0 {
+		speed = 4
+	}
+
+	// Ensure fallback is vanilla-safe
+	fallback := byte(m.FallBack)
+	if fallback > 49 {
+		fallback = 1
+	}
+
+	return clampBlockProperties(CustomBlock{
+		ID:            byte(m.BlockID),
+		Name:          m.Name,
+		Solidity:      byte(m.CollideType),
+		Speed:         speed,
+		TopTex:        byte(m.TopTex),
+		SideTex:       sideTex,
+		BottomTex:     byte(m.BottomTex),
+		TransmitLight: transmit,
+		WalkSound:     byte(m.WalkSound),
+		FullBright:    bright,
+		Shape:         byte(m.Shape),
+		BlockDraw:     byte(m.BlockDraw),
+		FogDensity:    byte(m.FogDensity),
+		FogR:          byte(m.FogR),
+		FogG:          byte(m.FogG),
+		FogB:          byte(m.FogB),
+		Fallback:      fallback,
+	})
+}
+
+// importMCGalaxyBlocks reads an MCGalaxy-format JSON file and merges
+// the blocks into the custom blocks map. Returns counts of imported
+// and skipped blocks plus any error.
+func importMCGalaxyBlocks(path string) (imported, skipped int, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Strip UTF-8 BOM
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		data = data[3:]
+	}
+
+	var defs []mcgBlockDef
+	if err := json.Unmarshal(data, &defs); err != nil {
+		return 0, 0, fmt.Errorf("JSON parse error: %w", err)
+	}
+
+	customBlocksMu.Lock()
+	defer customBlocksMu.Unlock()
+
+	for _, m := range defs {
+		if m.BlockID < 50 || m.BlockID > 255 {
+			log.Printf("[Import] Skipping block %d (%q) — ID out of range 50-255", m.BlockID, m.Name)
+			skipped++
+			continue
+		}
+		cb := mcgToCustomBlock(m)
+		customBlocks[cb.ID] = cb
+		imported++
+		log.Printf("[Import] Imported block %d: %q (tex %d/%d/%d, fb %d)",
+			cb.ID, cb.Name, cb.TopTex, cb.SideTex, cb.BottomTex, cb.Fallback)
+	}
+
+	return imported, skipped, nil
+}
+
+func saveCustomBlocks() {
+	customBlocksMu.RLock()
+	list := make([]CustomBlock, 0, len(customBlocks))
+	for _, cb := range customBlocks {
+		list = append(list, cb)
+	}
+	customBlocksMu.RUnlock()
+	data, _ := json.MarshalIndent(list, "", "  ")
+	os.WriteFile("customblocks.json", data, 0644)
+}
+
+// sendDefineBlock sends a CPE DefineBlock (0x23) packet to a single connection.
+func sendDefineBlock(conn net.Conn, cb CustomBlock) {
+	pkt := make([]byte, 80)
+	pkt[0] = 0x23
+	pkt[1] = cb.ID
+	copy(pkt[2:66], padString(cb.Name))
+	pkt[66] = cb.Solidity
+	pkt[67] = cb.Speed
+	pkt[68] = cb.TopTex
+	pkt[69] = cb.SideTex
+	pkt[70] = cb.BottomTex
+	pkt[71] = cb.TransmitLight
+	pkt[72] = cb.WalkSound
+	pkt[73] = cb.FullBright
+	pkt[74] = cb.Shape
+	pkt[75] = cb.BlockDraw
+	pkt[76] = cb.FogDensity
+	pkt[77] = cb.FogR
+	pkt[78] = cb.FogG
+	pkt[79] = cb.FogB
+	conn.Write(pkt)
+}
+
+// sendRemoveBlockDef sends a CPE RemoveBlockDefinition (0x24) packet.
+func sendRemoveBlockDef(conn net.Conn, id byte) {
+	conn.Write([]byte{0x24, id})
+}
+
+// sendAllCustomBlocks sends every stored definition to a connection.
+func sendAllCustomBlocks(conn net.Conn) {
+	customBlocksMu.RLock()
+	defer customBlocksMu.RUnlock()
+	for _, cb := range customBlocks {
+		sendDefineBlock(conn, cb)
+	}
+}
+
+// broadcastDefineBlock pushes a definition to every connected BlockDefs client.
+func (s *Server) broadcastDefineBlock(cb CustomBlock) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.players {
+		if p.SupportsBlockDefs {
+			sendDefineBlock(p.Conn, cb)
+		}
+	}
+}
+
+// broadcastRemoveBlock pushes a remove to every connected BlockDefs client.
+func (s *Server) broadcastRemoveBlock(id byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, p := range s.players {
+		if p.SupportsBlockDefs {
+			sendRemoveBlockDef(p.Conn, id)
+		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PLAYER DB PERSISTENCE
+// ═══════════════════════════════════════════════════════════════════
 
 type PlayerState struct {
 	World          string            `json:"world"`
@@ -403,18 +694,20 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 // ═══════════════════════════════════════════════════════════════════
 
 type Player struct {
-	Conn           net.Conn
-	Username       string
-	World          *World
-	Server         *Server
-	X, Y, Z        int16
-	Yaw, Pitch     byte
-	Authenticated  map[string]bool
-	SavedPasswords map[string]string
-	PendingWorld   *World
-	SupportsCPE    bool
-	IsOp           bool
-	mu             sync.Mutex
+	Conn              net.Conn
+	Username          string
+	World             *World
+	Server            *Server
+	X, Y, Z           int16
+	Yaw, Pitch        byte
+	Authenticated     map[string]bool
+	SavedPasswords    map[string]string
+	PendingWorld      *World
+	SupportsCPE       bool // client negotiated CustomBlocks (ids 50-65 natively)
+	SupportsBlockDefs bool // client negotiated BlockDefinitions CPE extension
+	SupportsHeldBlock bool // client negotiated HeldBlock CPE extension
+	IsOp              bool
+	mu                sync.Mutex
 }
 
 func (p *Player) SendMessage(msg string) {
@@ -425,8 +718,17 @@ func (p *Player) SendMessage(msg string) {
 	p.Conn.Write(pkt)
 }
 
-// Blocks 50-65 Fallback mechanism for Vanilla Classic Clients
+// getFallbackBlock returns a vanilla-safe block for non-CPE clients.
+// User-defined custom blocks are checked first for their configured fallback,
+// then the built-in CPE 50-65 table is used.
 func getFallbackBlock(b byte) byte {
+	customBlocksMu.RLock()
+	if cb, ok := customBlocks[b]; ok {
+		customBlocksMu.RUnlock()
+		return cb.Fallback
+	}
+	customBlocksMu.RUnlock()
+
 	switch b {
 	case 50:
 		return 44 // Cobblestone Slab -> Slab
@@ -462,7 +764,7 @@ func getFallbackBlock(b byte) byte {
 		return 1 // Stone Brick -> Stone
 	default:
 		if b > 49 {
-			return 1 // Stone fallback for undefined
+			return 1
 		}
 		return b
 	}
@@ -481,13 +783,18 @@ func sendBlockUpdate(conn net.Conn, x, y, z int16, block byte, supportsCPE bool)
 	conn.Write(pkt)
 }
 
+// sendSetHeldBlock sends a CPE HeldBlock (0x14) packet to set the
+// block the player is holding in their hand.
+func sendSetHeldBlock(conn net.Conn, blockID byte, preventChange byte) {
+	conn.Write([]byte{0x14, blockID, preventChange})
+}
+
 func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 	pw, hasPw := serverConfig.WorldPasswords[target.Name]
 	if hasPw && pw != "" {
 		p.mu.Lock()
 		authed := p.Authenticated[target.Name]
 		if !authed {
-			// Auto-authenticate if we have a matching saved password
 			if savedPw, ok := p.SavedPasswords[target.Name]; ok && savedPw == pw {
 				p.Authenticated[target.Name] = true
 				authed = true
@@ -559,9 +866,9 @@ var clientPacketSizes = map[byte]int{
 	0x05: 8,
 	0x08: 9,
 	0x0D: 65,
-	0x10: 66, // ExtInfo (for dynamic handling)
+	0x10: 66, // ExtInfo
 	0x11: 68, // ExtEntry
-	0x12: 1,  // CustomBlockSupportLevel
+	0x13: 1,  // CustomBlockSupportLevel
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -583,20 +890,33 @@ func handleConnection(conn net.Conn, server *Server) {
 		magic = 0x42
 	}
 
-	// 1. MUST send ServerIdentification BEFORE the CPE handshake!
+	// Server identification MUST be sent before the CPE handshake
 	writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
 
-	// --- Quick Fix CPE Handshake ---
+	// ── CPE Handshake ──────────────────────────────────────────
 	clientSupportsCustomBlocks := false
-	if cpe {
-		writeUint8(conn, 0x10)
-		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 1) // Only 1 extension now
+	clientSupportsBlockDefs := false
+	clientSupportsHeldBlock := false
 
-		writeUint8(conn, 0x11)
+	if cpe {
+		// Advertise three extensions
+		writeUint8(conn, 0x10) // ExtInfo
+		writeString(conn, serverConfig.ServerName)
+		writeInt16(conn, 3) // 3 extensions
+
+		writeUint8(conn, 0x11) // ExtEntry 1
 		writeString(conn, "CustomBlocks")
 		writeInt32(conn, 1)
 
+		writeUint8(conn, 0x11) // ExtEntry 2
+		writeString(conn, "BlockDefinitions")
+		writeInt32(conn, 1)
+
+		writeUint8(conn, 0x11) // ExtEntry 3
+		writeString(conn, "HeldBlock")
+		writeInt32(conn, 1)
+
+		// Read the client's extension list
 		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		expectedEntries := -1
 		entriesRead := 0
@@ -607,49 +927,61 @@ func handleConnection(conn net.Conn, server *Server) {
 				break
 			}
 
-			if pidBuf[0] == 0x10 {
+			if pidBuf[0] == 0x10 { // Client ExtInfo
 				extInfo := make([]byte, 66)
 				io.ReadFull(conn, extInfo)
 				expectedEntries = int(binary.BigEndian.Uint16(extInfo[64:66]))
 				if expectedEntries == 0 {
 					break
 				}
-			} else if pidBuf[0] == 0x11 {
+			} else if pidBuf[0] == 0x11 { // Client ExtEntry
 				extEntry := make([]byte, 68)
 				io.ReadFull(conn, extEntry)
 				extName := strings.TrimRight(string(extEntry[0:64]), " ")
-				if extName == "CustomBlocks" {
+				switch extName {
+				case "CustomBlocks":
 					clientSupportsCustomBlocks = true
+				case "BlockDefinitions":
+					clientSupportsBlockDefs = true
+				case "HeldBlock":
+					clientSupportsHeldBlock = true
 				}
 				entriesRead++
 			} else {
 				break
 			}
 		}
+		conn.SetReadDeadline(time.Time{})
 
+		// CustomBlocks level exchange — opcode is 0x13 per CPE spec
 		if clientSupportsCustomBlocks {
-			writeUint8(conn, 0x12)
-			writeUint8(conn, 1) // Level 1
+			writeUint8(conn, 0x13)
+			writeUint8(conn, 1) // Support Level 1
 
-			// Absorb the client's 0x12 reply to prevent it from bleeding into the map chunks
+			// Read the client's 0x13 reply
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			pidBuf := make([]byte, 1)
-			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x12 {
+			if _, err := io.ReadFull(conn, pidBuf); err == nil && pidBuf[0] == 0x13 {
 				io.ReadFull(conn, make([]byte, 1))
 			}
+			conn.SetReadDeadline(time.Time{})
 		}
-		conn.SetReadDeadline(time.Time{})
 	}
 
-	// Send Server Identification AFTER the handshake is finished
-	//writePacket00(conn, 7, serverConfig.ServerName, serverConfig.Motd, magic)
-
 	player := &Player{
-		Conn:           conn,
-		Username:       username,
-		Server:         server,
-		Authenticated:  make(map[string]bool),
-		SavedPasswords: make(map[string]string),
-		SupportsCPE:    clientSupportsCustomBlocks,
+		Conn:              conn,
+		Username:          username,
+		Server:            server,
+		Authenticated:     make(map[string]bool),
+		SavedPasswords:    make(map[string]string),
+		SupportsCPE:       clientSupportsCustomBlocks,
+		SupportsBlockDefs: clientSupportsBlockDefs,
+		SupportsHeldBlock: clientSupportsHeldBlock,
+	}
+
+	// Push all custom block definitions BEFORE the first map is sent
+	if clientSupportsBlockDefs {
+		sendAllCustomBlocks(conn)
 	}
 
 	server.mu.Lock()
@@ -748,7 +1080,6 @@ func handleConnection(conn net.Conn, server *Server) {
 			if !cancel && player.World != nil {
 				player.World.SetBlock(int(x), int(y), int(z), block)
 
-				// Broadcast the block update to all players in the same world
 				server.mu.RLock()
 				for _, p2 := range server.players {
 					if p2.World == player.World && p2 != player {
@@ -772,6 +1103,7 @@ func handleConnection(conn net.Conn, server *Server) {
 		case 0x0D:
 			msg := strings.TrimRight(string(data[1:65]), " ")
 
+			// ── /op ──
 			if strings.HasPrefix(msg, "/op ") {
 				password := strings.TrimPrefix(msg, "/op ")
 				if serverConfig.OpPassword != "" && hashPassword(password) == serverConfig.OpPassword {
@@ -783,6 +1115,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── /pass ──
 			if strings.HasPrefix(msg, "/pass ") {
 				password := strings.TrimPrefix(msg, "/pass ")
 				player.mu.Lock()
@@ -795,7 +1128,7 @@ func handleConnection(conn net.Conn, server *Server) {
 					player.SavedPasswords[pending.Name] = hashPassword(password)
 					player.PendingWorld = nil
 					player.mu.Unlock()
-					updatePlayerState(player) // Immediately save logic to JSON
+					updatePlayerState(player)
 					player.SendMessage("&aPassword accepted!")
 					player.ChangeWorld(pending, false)
 				} else {
@@ -804,6 +1137,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── /set ──
 			if strings.HasPrefix(msg, "/set ") {
 				if !player.IsOp {
 					player.SendMessage("&cYou must be an operator to use /set.")
@@ -820,11 +1154,51 @@ func handleConnection(conn net.Conn, server *Server) {
 					saveConfig()
 					player.SendMessage(fmt.Sprintf("&ePassword for world '%s' securely updated.", worldName))
 				} else {
-					player.SendMessage("&cUsage: /set op <pass> OR /set world <name> <pass>")
+					player.SendMessage("&cUsage: /set op <pass> OR /set world <n> <pass>")
 				}
 				continue
 			}
 
+			// ── /bg — Custom Block Management (op only) ──
+			if msg == "/bg" || strings.HasPrefix(msg, "/bg ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /bg.")
+					continue
+				}
+				handleBlockCommand(player, server, msg)
+				continue
+			}
+
+			// ── /hand <id> [lock] — Set the block in your hand ──
+			if strings.HasPrefix(msg, "/hand ") {
+				parts := strings.Fields(msg)
+				if len(parts) < 2 {
+					player.SendMessage("&cUsage: /hand <blockID> [lock]")
+					continue
+				}
+				id, err := strconv.Atoi(parts[1])
+				if err != nil || id < 0 || id > 255 {
+					player.SendMessage("&cBlock ID must be 0-255.")
+					continue
+				}
+				if !player.SupportsHeldBlock {
+					player.SendMessage("&cYour client does not support the HeldBlock extension.")
+					continue
+				}
+				lock := byte(0)
+				if len(parts) >= 3 && (parts[2] == "lock" || parts[2] == "1") {
+					lock = 1
+				}
+				sendSetHeldBlock(player.Conn, byte(id), lock)
+				lockStr := ""
+				if lock == 1 {
+					lockStr = " &7(locked)"
+				}
+				player.SendMessage(fmt.Sprintf("&aHeld block set to %d.%s", id, lockStr))
+				continue
+			}
+
+			// ── /goto ──
 			if strings.HasPrefix(msg, "/goto ") {
 				name := strings.TrimPrefix(msg, "/goto ")
 				if w, ok := server.GetWorld(name); ok {
@@ -835,6 +1209,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── /newlvl ──
 			if strings.HasPrefix(msg, "/newlvl ") {
 				if !player.IsOp {
 					player.SendMessage("&cYou must be a server op to use this command.")
@@ -857,6 +1232,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── /resizelvl ──
 			if strings.HasPrefix(msg, "/resizelvl ") {
 				if !player.IsOp {
 					player.SendMessage("&cYou must be a server op to use this command.")
@@ -903,6 +1279,7 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── chat ──
 			cancel := false
 			for _, pl := range server.plugins {
 				if pl.OnChat(player, msg) == EventCancel {
@@ -910,7 +1287,6 @@ func handleConnection(conn net.Conn, server *Server) {
 					break
 				}
 			}
-
 			if !cancel {
 				server.mu.RLock()
 				for _, p2 := range server.players {
@@ -921,6 +1297,425 @@ func handleConnection(conn net.Conn, server *Server) {
 				server.mu.RUnlock()
 			}
 		}
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// /bg  COMMAND  HANDLER  —  Custom Block Definitions
+// ═══════════════════════════════════════════════════════════════════
+
+var bgPropertyHelp = map[string]string{
+	"name":      "Block display name (can contain spaces)",
+	"solidity":  "0=walk-through 1=swim-through 2=solid",
+	"speed":     "1=0.25x 2=0.5x 3=0.75x 4=1.0x 5=1.25x 6=1.5x 7=1.75x 8=2.0x",
+	"toptex":    "Texture atlas index for top face",
+	"sidetex":   "Texture atlas index for all side faces",
+	"bottomtex": "Texture atlas index for bottom face",
+	"alltex":    "Set top+side+bottom textures at once",
+	"light":     "0=blocks light 1=transmits light",
+	"sound":     "0=none 1=wood 2=gravel 3=grass 4=stone 5=metal 6=glass 7=wool 8=sand 9=snow",
+	"bright":    "0=normal 1=full bright (glows)",
+	"shape":     "0=sprite 1-16=height in sixteenths (16=full block)",
+	"draw":      "0=opaque 1=transparent(same) 2=transparent(diff) 3=translucent 4=gas",
+	"fog":       "density r g b  (each 0-255)",
+	"fallback":  "Vanilla block ID for non-CPE clients (0-49)",
+}
+
+func handleBlockCommand(player *Player, server *Server, msg string) {
+	parts := strings.Fields(msg)
+	if len(parts) < 2 {
+		player.SendMessage("&e--- Custom Block commands ---")
+		player.SendMessage("&b/bg define <id> <name> &7- create (50-255)")
+		player.SendMessage("&b/bg set <id> <prop> <val> &7- edit property")
+		player.SendMessage("&b/bg remove <id> &7- delete definition")
+		player.SendMessage("&b/bg list &7- show all custom blocks")
+		player.SendMessage("&b/bg info <id> &7- show block details")
+		player.SendMessage("&b/bg props &7- list editable properties")
+		player.SendMessage("&b/bg copy <src> <dst> &7- duplicate a block")
+		player.SendMessage("&b/bg import [path] &7- load MCGalaxy global.json")
+		player.SendMessage("&b/bg export [path] &7- save as MCGalaxy format")
+		return
+	}
+
+	switch parts[1] {
+
+	// ── /bg define <id> <name…> ──────────────────────────────
+	case "define":
+		if len(parts) < 4 {
+			player.SendMessage("&cUsage: /bg define <id 50-255> <name>")
+			return
+		}
+		id, err := strconv.Atoi(parts[2])
+		if err != nil || id < 50 || id > 255 {
+			player.SendMessage("&cBlock ID must be between 50 and 255.")
+			return
+		}
+		name := strings.Join(parts[3:], " ")
+		if len(name) > 64 {
+			name = name[:64]
+		}
+
+		customBlocksMu.RLock()
+		_, exists := customBlocks[byte(id)]
+		customBlocksMu.RUnlock()
+		if exists {
+			player.SendMessage(fmt.Sprintf("&cBlock %d already exists. /bg remove %d first.", id, id))
+			return
+		}
+
+		cb := CustomBlock{
+			ID:            byte(id),
+			Name:          name,
+			Solidity:      2, // solid
+			Speed:         4, // normal speed
+			TopTex:        1, // stone texture
+			SideTex:       1,
+			BottomTex:     1,
+			TransmitLight: 0,
+			WalkSound:     4, // stone sound
+			FullBright:    0,
+			Shape:         16, // full block
+			BlockDraw:     0,  // opaque
+			FogDensity:    0,
+			FogR:          0,
+			FogG:          0,
+			FogB:          0,
+			Fallback:      1, // stone
+		}
+
+		customBlocksMu.Lock()
+		customBlocks[byte(id)] = cb
+		customBlocksMu.Unlock()
+		saveCustomBlocks()
+		server.broadcastDefineBlock(cb)
+
+		player.SendMessage(fmt.Sprintf("&aBlock %d &f(%s)&a defined!", id, name))
+		player.SendMessage("&7Use &b/bg set " + parts[2] + " <prop> <val>&7 to customise it.")
+
+	// ── /bg set <id> <property> <value…> ─────────────────────
+	case "set":
+		if len(parts) < 5 {
+			player.SendMessage("&cUsage: /bg set <id> <property> <value>")
+			player.SendMessage("&7Type &b/bg props&7 for the property list.")
+			return
+		}
+		id, err := strconv.Atoi(parts[2])
+		if err != nil || id < 50 || id > 255 {
+			player.SendMessage("&cBlock ID must be between 50 and 255.")
+			return
+		}
+
+		customBlocksMu.RLock()
+		cb, exists := customBlocks[byte(id)]
+		customBlocksMu.RUnlock()
+		if !exists {
+			player.SendMessage(fmt.Sprintf("&cBlock %d is not defined.", id))
+			return
+		}
+
+		prop := strings.ToLower(parts[3])
+		valStr := parts[4]
+		parseByte := func() byte { n, _ := strconv.Atoi(valStr); return byte(n) }
+
+		switch prop {
+		case "name":
+			cb.Name = strings.Join(parts[4:], " ")
+			if len(cb.Name) > 64 {
+				cb.Name = cb.Name[:64]
+			}
+		case "solidity":
+			v := parseByte()
+			if v > 2 {
+				player.SendMessage("&c" + bgPropertyHelp["solidity"])
+				return
+			}
+			cb.Solidity = v
+		case "speed":
+			v := parseByte()
+			if v < 1 || v > 8 {
+				player.SendMessage("&c" + bgPropertyHelp["speed"])
+				return
+			}
+			cb.Speed = v
+		case "toptex":
+			cb.TopTex = parseByte()
+		case "sidetex":
+			cb.SideTex = parseByte()
+		case "bottomtex":
+			cb.BottomTex = parseByte()
+		case "alltex":
+			t := parseByte()
+			cb.TopTex = t
+			cb.SideTex = t
+			cb.BottomTex = t
+		case "light":
+			v := parseByte()
+			if v > 1 {
+				player.SendMessage("&c" + bgPropertyHelp["light"])
+				return
+			}
+			cb.TransmitLight = v
+		case "sound":
+			v := parseByte()
+			if v > 9 {
+				player.SendMessage("&c" + bgPropertyHelp["sound"])
+				return
+			}
+			cb.WalkSound = v
+		case "bright":
+			v := parseByte()
+			if v > 1 {
+				player.SendMessage("&c" + bgPropertyHelp["bright"])
+				return
+			}
+			cb.FullBright = v
+		case "shape":
+			v := parseByte()
+			if v > 16 {
+				player.SendMessage("&c" + bgPropertyHelp["shape"])
+				return
+			}
+			cb.Shape = v
+		case "draw":
+			v := parseByte()
+			if v > 4 {
+				player.SendMessage("&c" + bgPropertyHelp["draw"])
+				return
+			}
+			cb.BlockDraw = v
+		case "fog":
+			if len(parts) < 8 {
+				player.SendMessage("&cUsage: /bg set <id> fog <density> <r> <g> <b>")
+				return
+			}
+			d, _ := strconv.Atoi(parts[4])
+			r, _ := strconv.Atoi(parts[5])
+			g, _ := strconv.Atoi(parts[6])
+			bl, _ := strconv.Atoi(parts[7])
+			cb.FogDensity = byte(d)
+			cb.FogR = byte(r)
+			cb.FogG = byte(g)
+			cb.FogB = byte(bl)
+		case "fallback":
+			v := parseByte()
+			if v > 49 {
+				player.SendMessage("&cFallback must be a vanilla block (0-49).")
+				return
+			}
+			cb.Fallback = v
+		default:
+			player.SendMessage("&cUnknown property: &e" + prop)
+			player.SendMessage("&7Type &b/bg props&7 for the full list.")
+			return
+		}
+
+		customBlocksMu.Lock()
+		customBlocks[byte(id)] = clampBlockProperties(cb)
+		customBlocksMu.Unlock()
+		saveCustomBlocks()
+		server.broadcastDefineBlock(cb)
+
+		player.SendMessage(fmt.Sprintf("&aBlock %d: %s = %s", id, prop, strings.Join(parts[4:], " ")))
+
+	// ── /bg remove <id> ──────────────────────────────────────
+	case "remove":
+		if len(parts) < 3 {
+			player.SendMessage("&cUsage: /bg remove <id>")
+			return
+		}
+		id, err := strconv.Atoi(parts[2])
+		if err != nil || id < 50 || id > 255 {
+			player.SendMessage("&cBlock ID must be between 50 and 255.")
+			return
+		}
+
+		customBlocksMu.Lock()
+		_, exists := customBlocks[byte(id)]
+		if exists {
+			delete(customBlocks, byte(id))
+		}
+		customBlocksMu.Unlock()
+
+		if !exists {
+			player.SendMessage(fmt.Sprintf("&cBlock %d is not defined.", id))
+			return
+		}
+
+		saveCustomBlocks()
+		server.broadcastRemoveBlock(byte(id))
+		player.SendMessage(fmt.Sprintf("&aBlock %d removed.", id))
+
+	// ── /bg list ─────────────────────────────────────────────
+	case "list":
+		customBlocksMu.RLock()
+		count := len(customBlocks)
+		if count == 0 {
+			customBlocksMu.RUnlock()
+			player.SendMessage("&eNo custom blocks defined yet.")
+			player.SendMessage("&7Use &b/bg define <id> <name>&7 to create one.")
+			return
+		}
+		player.SendMessage(fmt.Sprintf("&e--- Custom Blocks (%d) ---", count))
+		for _, cb := range customBlocks {
+			player.SendMessage(fmt.Sprintf("  &b%d &f%s &7tex:%d/%d/%d fb:%d",
+				cb.ID, cb.Name, cb.TopTex, cb.SideTex, cb.BottomTex, cb.Fallback))
+		}
+		customBlocksMu.RUnlock()
+
+	// ── /bg info <id> ────────────────────────────────────────
+	case "info":
+		if len(parts) < 3 {
+			player.SendMessage("&cUsage: /bg info <id>")
+			return
+		}
+		id, err := strconv.Atoi(parts[2])
+		if err != nil || id < 50 || id > 255 {
+			player.SendMessage("&cBlock ID must be between 50 and 255.")
+			return
+		}
+		customBlocksMu.RLock()
+		cb, exists := customBlocks[byte(id)]
+		customBlocksMu.RUnlock()
+		if !exists {
+			player.SendMessage(fmt.Sprintf("&cBlock %d is not defined.", id))
+			return
+		}
+		player.SendMessage(fmt.Sprintf("&e--- Block %d: &f%s &e---", cb.ID, cb.Name))
+		player.SendMessage(fmt.Sprintf("  &7solidity=&f%d &7speed=&f%d &7shape=&f%d &7draw=&f%d", cb.Solidity, cb.Speed, cb.Shape, cb.BlockDraw))
+		player.SendMessage(fmt.Sprintf("  &7toptex=&f%d &7sidetex=&f%d &7bottomtex=&f%d", cb.TopTex, cb.SideTex, cb.BottomTex))
+		player.SendMessage(fmt.Sprintf("  &7light=&f%d &7sound=&f%d &7bright=&f%d", cb.TransmitLight, cb.WalkSound, cb.FullBright))
+		player.SendMessage(fmt.Sprintf("  &7fog=&f%d,%d,%d,%d &7fallback=&f%d", cb.FogDensity, cb.FogR, cb.FogG, cb.FogB, cb.Fallback))
+
+	// ── /bg copy <src> <dst> ─────────────────────────────────
+	case "copy":
+		if len(parts) < 4 {
+			player.SendMessage("&cUsage: /bg copy <srcID> <dstID>")
+			return
+		}
+		srcID, err1 := strconv.Atoi(parts[2])
+		dstID, err2 := strconv.Atoi(parts[3])
+		if err1 != nil || err2 != nil || srcID < 50 || srcID > 255 || dstID < 50 || dstID > 255 {
+			player.SendMessage("&cBoth IDs must be between 50 and 255.")
+			return
+		}
+		customBlocksMu.RLock()
+		src, srcExists := customBlocks[byte(srcID)]
+		_, dstExists := customBlocks[byte(dstID)]
+		customBlocksMu.RUnlock()
+		if !srcExists {
+			player.SendMessage(fmt.Sprintf("&cSource block %d is not defined.", srcID))
+			return
+		}
+		if dstExists {
+			player.SendMessage(fmt.Sprintf("&cDestination block %d already exists. /bg remove %d first.", dstID, dstID))
+			return
+		}
+		dst := src
+		dst.ID = byte(dstID)
+		dst.Name = src.Name + " (copy)"
+		if len(dst.Name) > 64 {
+			dst.Name = dst.Name[:64]
+		}
+
+		customBlocksMu.Lock()
+		customBlocks[byte(dstID)] = dst
+		customBlocksMu.Unlock()
+		saveCustomBlocks()
+		server.broadcastDefineBlock(dst)
+
+		player.SendMessage(fmt.Sprintf("&aBlock %d copied to %d.", srcID, dstID))
+
+	// ── /bg props ────────────────────────────────────────────
+	case "props":
+		player.SendMessage("&e--- Editable properties ---")
+		for _, kv := range []struct{ k, v string }{
+			{"name", bgPropertyHelp["name"]},
+			{"solidity", bgPropertyHelp["solidity"]},
+			{"speed", bgPropertyHelp["speed"]},
+			{"toptex", bgPropertyHelp["toptex"]},
+			{"sidetex", bgPropertyHelp["sidetex"]},
+			{"bottomtex", bgPropertyHelp["bottomtex"]},
+			{"alltex", bgPropertyHelp["alltex"]},
+			{"light", bgPropertyHelp["light"]},
+			{"sound", bgPropertyHelp["sound"]},
+			{"bright", bgPropertyHelp["bright"]},
+			{"shape", bgPropertyHelp["shape"]},
+			{"draw", bgPropertyHelp["draw"]},
+			{"fog", bgPropertyHelp["fog"]},
+			{"fallback", bgPropertyHelp["fallback"]},
+		} {
+			player.SendMessage(fmt.Sprintf("  &b%-9s &7%s", kv.k, kv.v))
+		}
+
+	// ── /bg import [path] ────────────────────────────────────
+	case "import":
+		path := "global.json"
+		if len(parts) >= 3 {
+			path = strings.Join(parts[2:], " ")
+		}
+		player.SendMessage("&eImporting MCGalaxy blocks from &f" + path + "&e...")
+		imported, skipped, err := importMCGalaxyBlocks(path)
+		if err != nil {
+			player.SendMessage("&cImport failed: " + err.Error())
+			return
+		}
+		if imported > 0 {
+			saveCustomBlocks()
+			// Push all definitions to connected BlockDefs clients
+			customBlocksMu.RLock()
+			for _, cb := range customBlocks {
+				server.broadcastDefineBlock(cb)
+			}
+			customBlocksMu.RUnlock()
+		}
+		player.SendMessage(fmt.Sprintf("&aImported %d block(s), skipped %d.", imported, skipped))
+
+	// ── /bg export [path] ────────────────────────────────────
+	case "export":
+		path := "global_export.json"
+		if len(parts) >= 3 {
+			path = strings.Join(parts[2:], " ")
+		}
+		customBlocksMu.RLock()
+		var out []mcgBlockDef
+		for _, cb := range customBlocks {
+			blocksLight := cb.TransmitLight == 0
+			fullBright := cb.FullBright == 1
+			out = append(out, mcgBlockDef{
+				BlockID:     int(cb.ID),
+				Name:        cb.Name,
+				Speed:       int(cb.Speed),
+				CollideType: int(cb.Solidity),
+				TopTex:      int(cb.TopTex),
+				BottomTex:   int(cb.BottomTex),
+				LeftTex:     int(cb.SideTex),
+				RightTex:    int(cb.SideTex),
+				FrontTex:    int(cb.SideTex),
+				BackTex:     int(cb.SideTex),
+				BlocksLight: blocksLight,
+				WalkSound:   int(cb.WalkSound),
+				FullBright:  fullBright,
+				Shape:       int(cb.Shape),
+				BlockDraw:   int(cb.BlockDraw),
+				FallBack:    int(cb.Fallback),
+				FogDensity:  int(cb.FogDensity),
+				FogR:        int(cb.FogR),
+				FogG:        int(cb.FogG),
+				FogB:        int(cb.FogB),
+				MinX:        0, MinY: 0, MinZ: 0,
+				MaxX: 16, MaxY: 16, MaxZ: 16,
+			})
+		}
+		customBlocksMu.RUnlock()
+		data, _ := json.MarshalIndent(out, "", "    ")
+		if err := os.WriteFile(path, data, 0644); err != nil {
+			player.SendMessage("&cExport failed: " + err.Error())
+			return
+		}
+		player.SendMessage(fmt.Sprintf("&aExported %d block(s) to &f%s", len(out), path))
+
+	default:
+		player.SendMessage("&cUnknown subcommand. Type &b/bg&c for help.")
 	}
 }
 
@@ -982,7 +1777,13 @@ func (l *LogPlugin) Name() string { return "EventLogger" }
 func (l *LogPlugin) OnPlayerJoin(p *Player, w *World) EventResult {
 	cpeStatus := "Vanilla"
 	if p.SupportsCPE {
-		cpeStatus = "CPE-Capable"
+		cpeStatus = "CPE"
+		if p.SupportsBlockDefs {
+			cpeStatus += "+BlockDefs"
+		}
+		if p.SupportsHeldBlock {
+			cpeStatus += "+HeldBlock"
+		}
 	}
 	log.Printf("[Log] %s → joined %q [%s]", p.Username, w.Name, cpeStatus)
 	return EventContinue
@@ -1121,7 +1922,6 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 	world.mu.RLock()
 	snapshot := make([]byte, len(world.Blocks))
 
-	// Ensure non-CPE clients don't crash from unsupported >49 IDs
 	if supportsCPE {
 		copy(snapshot, world.Blocks)
 	} else {
@@ -1153,7 +1953,7 @@ func sendMapToPlayer(conn net.Conn, world *World, supportsCPE bool) {
 		chunk := compressed[i:end]
 		progress := byte(i * 100 / total)
 
-		size := chunkSize // Assign to a variable to satisfy the Go compiler
+		size := chunkSize
 		pkt := make([]byte, 0, 1+2+chunkSize+1)
 		pkt = append(pkt, 0x03, byte(size>>8), byte(size))
 		padded := make([]byte, chunkSize)
@@ -1197,6 +1997,19 @@ func writeString(w io.Writer, s string) { w.Write(padString(s)) }
 func main() {
 	loadConfig()
 	loadPlayerDB()
+	loadCustomBlocks()
+
+	// Auto-import MCGalaxy global.json if present (merges with customblocks.json)
+	if _, err := os.Stat("global.json"); err == nil {
+		imported, skipped, err := importMCGalaxyBlocks("global.json")
+		if err != nil {
+			log.Printf("[Blocks] Failed to import global.json: %v", err)
+		} else if imported > 0 {
+			log.Printf("[Blocks] Auto-imported %d block(s) from global.json (%d skipped)", imported, skipped)
+			saveCustomBlocks() // persist the merged result
+		}
+	}
+
 	server := NewServer()
 
 	server.RegisterPlugin(&HubProtectionPlugin{})
@@ -1237,6 +2050,11 @@ func main() {
 			server.mu.RUnlock()
 		}
 	}()
+
+	customBlocksMu.RLock()
+	cbCount := len(customBlocks)
+	customBlocksMu.RUnlock()
+	log.Printf("[Blocks] %d custom block definition(s) loaded", cbCount)
 
 	ln, err := net.Listen("tcp", serverConfig.Port)
 	if err != nil {
