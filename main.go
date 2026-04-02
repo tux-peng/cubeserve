@@ -751,6 +751,159 @@ func updatePlayerState(p *Player) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// BLOCK HISTORY — per-world change log with inspect & rollback
+// ═══════════════════════════════════════════════════════════════════
+
+type BlockChange struct {
+	Time     int64  `json:"t"`
+	Player   string `json:"p"`
+	X        int16  `json:"x"`
+	Y        int16  `json:"y"`
+	Z        int16  `json:"z"`
+	OldBlock byte   `json:"ob"`
+	NewBlock byte   `json:"nb"`
+}
+
+// blockHistory stores the change log per world.
+// Key is the world name.
+var (
+	blockHistory   = make(map[string][]BlockChange)
+	blockHistoryMu sync.RWMutex
+)
+
+func recordBlockChange(worldName, player string, x, y, z int16, oldBlock, newBlock byte) {
+	entry := BlockChange{
+		Time:   time.Now().Unix(),
+		Player: player,
+		X:      x, Y: y, Z: z,
+		OldBlock: oldBlock,
+		NewBlock: newBlock,
+	}
+	blockHistoryMu.Lock()
+	blockHistory[worldName] = append(blockHistory[worldName], entry)
+	blockHistoryMu.Unlock()
+}
+
+// getBlockHistoryAt returns the history for a specific coordinate, newest first.
+func getBlockHistoryAt(worldName string, x, y, z int16, limit int) []BlockChange {
+	blockHistoryMu.RLock()
+	defer blockHistoryMu.RUnlock()
+
+	all := blockHistory[worldName]
+	var result []BlockChange
+	// Walk backwards for newest-first
+	for i := len(all) - 1; i >= 0; i-- {
+		c := all[i]
+		if c.X == x && c.Y == y && c.Z == z {
+			result = append(result, c)
+			if len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result
+}
+
+// getPlayerChanges returns all changes by a player in a world within a time window.
+func getPlayerChanges(worldName, player string, since int64) []BlockChange {
+	blockHistoryMu.RLock()
+	defer blockHistoryMu.RUnlock()
+
+	all := blockHistory[worldName]
+	var result []BlockChange
+	// Walk backwards so undo applies in reverse order
+	for i := len(all) - 1; i >= 0; i-- {
+		c := all[i]
+		if c.Time < since {
+			break
+		}
+		if strings.EqualFold(c.Player, player) {
+			result = append(result, c)
+		}
+	}
+	return result
+}
+
+func saveBlockHistory() {
+	blockHistoryMu.RLock()
+	defer blockHistoryMu.RUnlock()
+
+	os.MkdirAll("blockhistory", 0755)
+	for worldName, changes := range blockHistory {
+		if len(changes) == 0 {
+			continue
+		}
+		data, err := json.Marshal(changes)
+		if err != nil {
+			continue
+		}
+		os.WriteFile("blockhistory/"+worldName+".json", data, 0644)
+	}
+}
+
+func loadBlockHistory() {
+	entries, err := os.ReadDir("blockhistory")
+	if err != nil {
+		return
+	}
+	blockHistoryMu.Lock()
+	defer blockHistoryMu.Unlock()
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		worldName := strings.TrimSuffix(e.Name(), ".json")
+		data, err := os.ReadFile("blockhistory/" + e.Name())
+		if err != nil {
+			continue
+		}
+		var changes []BlockChange
+		if json.Unmarshal(data, &changes) == nil {
+			blockHistory[worldName] = changes
+			log.Printf("[History] Loaded %d changes for %q", len(changes), worldName)
+		}
+	}
+}
+
+// pruneBlockHistory removes entries older than maxAge from all worlds.
+func pruneBlockHistory(maxAge time.Duration) {
+	cutoff := time.Now().Add(-maxAge).Unix()
+	blockHistoryMu.Lock()
+	defer blockHistoryMu.Unlock()
+
+	total := 0
+	for worldName, changes := range blockHistory {
+		// Find first entry that's within the window
+		start := 0
+		for start < len(changes) && changes[start].Time < cutoff {
+			start++
+		}
+		if start > 0 {
+			total += start
+			blockHistory[worldName] = changes[start:]
+		}
+	}
+	if total > 0 {
+		log.Printf("[History] Pruned %d entries older than %v", total, maxAge)
+	}
+}
+
+func formatTimeAgo(unix int64) string {
+	d := time.Since(time.Unix(unix, 0))
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds ago", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // PLUGIN INTERFACE
 // ═══════════════════════════════════════════════════════════════════
 
@@ -982,6 +1135,7 @@ type Player struct {
 	SupportsHeldBlock   bool // client negotiated HeldBlock CPE extension
 	SupportsTexturePack bool // client negotiated EnvMapAspect CPE extension (texture URL)
 	IsOp                bool
+	InspectMode         bool // when true, next block click shows history instead of building
 	mu                  sync.Mutex
 }
 
@@ -1364,6 +1518,24 @@ func handleConnection(conn net.Conn, server *Server) {
 			z := int16(binary.BigEndian.Uint16(data[4:6]))
 			mode, block := data[6], data[7]
 
+			// ── Inspect mode: show block history instead of building ──
+			if player.InspectMode && player.World != nil {
+				// Revert the client's visual change
+				sendBlockUpdate(conn, x, y, z, player.World.GetBlock(int(x), int(y), int(z)), player.SupportsCPE)
+
+				history := getBlockHistoryAt(player.World.Name, x, y, z, 8)
+				if len(history) == 0 {
+					player.SendMessage(fmt.Sprintf("&e(%d,%d,%d)&7: No recorded changes.", x, y, z))
+				} else {
+					player.SendMessage(fmt.Sprintf("&e--- History at (%d,%d,%d) ---", x, y, z))
+					for _, c := range history {
+						player.SendMessage(fmt.Sprintf("  &b%s &7%s &fblock %d→%d",
+							c.Player, formatTimeAgo(c.Time), c.OldBlock, c.NewBlock))
+					}
+				}
+				continue
+			}
+
 			if mode != 0 {
 				isBanned := false
 				for _, b := range serverConfig.BannedBlocks {
@@ -1381,6 +1553,12 @@ func handleConnection(conn net.Conn, server *Server) {
 				}
 			}
 
+			// Capture old block before applying change
+			var oldBlock byte
+			if player.World != nil {
+				oldBlock = player.World.GetBlock(int(x), int(y), int(z))
+			}
+
 			if mode == 0 {
 				block = 0
 			}
@@ -1395,6 +1573,9 @@ func handleConnection(conn net.Conn, server *Server) {
 
 			if !cancel && player.World != nil {
 				player.World.SetBlock(int(x), int(y), int(z), block)
+
+				// Record the change
+				recordBlockChange(player.World.Name, player.Username, x, y, z, oldBlock, block)
 
 				server.mu.RLock()
 				for _, p2 := range server.players {
@@ -1664,6 +1845,93 @@ func handleConnection(conn net.Conn, server *Server) {
 					player.SendMessage(line)
 				}
 				banMutex.RUnlock()
+				continue
+			}
+
+			// ── /bi — Toggle block inspect mode (op only) ──
+			if msg == "/bi" {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /bi.")
+					continue
+				}
+				player.InspectMode = !player.InspectMode
+				if player.InspectMode {
+					player.SendMessage("&aBlock inspect ON &7— click any block to see its history.")
+					player.SendMessage("&7Type /bi again to turn off.")
+				} else {
+					player.SendMessage("&eBlock inspect OFF.")
+				}
+				continue
+			}
+
+			// ── /undo <player> [seconds] — Revert a player's changes ──
+			if strings.HasPrefix(msg, "/undo ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /undo.")
+					continue
+				}
+				if player.World == nil {
+					player.SendMessage("&cYou must be in a world.")
+					continue
+				}
+				parts := strings.Fields(msg)
+				if len(parts) < 2 {
+					player.SendMessage("&cUsage: /undo <player> [seconds]")
+					continue
+				}
+				targetName := parts[1]
+				seconds := int64(300) // default 5 minutes
+				if len(parts) >= 3 {
+					if n, err := strconv.ParseInt(parts[2], 10, 64); err == nil && n > 0 {
+						seconds = n
+					}
+				}
+				since := time.Now().Unix() - seconds
+
+				changes := getPlayerChanges(player.World.Name, targetName, since)
+				if len(changes) == 0 {
+					player.SendMessage(fmt.Sprintf("&eNo changes by %s in the last %ds.", targetName, seconds))
+					continue
+				}
+
+				// Apply reverts — changes are already newest-first
+				reverted := 0
+				for _, c := range changes {
+					player.World.SetBlock(int(c.X), int(c.Y), int(c.Z), c.OldBlock)
+					recordBlockChange(player.World.Name, "[undo:"+player.Username+"]", c.X, c.Y, c.Z, c.NewBlock, c.OldBlock)
+
+					// Broadcast the revert to all players in the world
+					server.mu.RLock()
+					for _, p2 := range server.players {
+						if p2.World == player.World {
+							sendBlockUpdate(p2.Conn, c.X, c.Y, c.Z, c.OldBlock, p2.SupportsCPE)
+						}
+					}
+					server.mu.RUnlock()
+					reverted++
+				}
+
+				player.SendMessage(fmt.Sprintf("&aReverted %d change(s) by %s (last %ds).", reverted, targetName, seconds))
+				log.Printf("[Undo] %s reverted %d changes by %s in %q", player.Username, reverted, targetName, player.World.Name)
+				continue
+			}
+
+			// ── /purgehistory [days] — Clear old history (op only) ──
+			if strings.HasPrefix(msg, "/purgehistory") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /purgehistory.")
+					continue
+				}
+				days := 7 // default
+				parts := strings.Fields(msg)
+				if len(parts) >= 2 {
+					if n, err := strconv.Atoi(parts[1]); err == nil && n > 0 {
+						days = n
+					}
+				}
+				pruneBlockHistory(time.Duration(days) * 24 * time.Hour)
+				saveBlockHistory()
+				player.SendMessage(fmt.Sprintf("&aPurged history older than %d day(s).", days))
 				continue
 			}
 
@@ -2479,6 +2747,7 @@ func main() {
 	loadPlayerDB()
 	loadCustomBlocks()
 	loadBanList()
+	loadBlockHistory()
 
 	// Generate a unique salt for this session (used by heartbeat + name verification)
 	serverSalt = generateSalt()
@@ -2516,22 +2785,30 @@ func main() {
 		world, err := LoadMCGalaxyLevel(path)
 		if err != nil {
 			log.Printf("[World]  %s not found — using generated flat world", path)
-			world = generateFlatWorld(1024, 16, 1024)
+			world = generateFlatWorld(512, 32, 512)
 			SaveMCGalaxyLevel(world, path)
 		}
 		server.AddWorld(name, world)
 	}
 
 	go func() {
+		saveCount := 0
 		for {
 			time.Sleep(30 * time.Second)
 			savePlayerDB()
+			saveBlockHistory()
 			server.mu.RLock()
 			for name, w := range server.worlds {
 				SaveMCGalaxyLevel(w, "levels/"+name+".lvl")
 				savePortals(w.Portals, "levels/"+name+".portals.json")
 			}
 			server.mu.RUnlock()
+
+			// Prune history older than 30 days every ~15 minutes
+			saveCount++
+			if saveCount%30 == 0 {
+				pruneBlockHistory(30 * 24 * time.Hour)
+			}
 		}
 	}()
 
@@ -2545,6 +2822,16 @@ func main() {
 	banMutex.RUnlock()
 	if banCount > 0 {
 		log.Printf("[Bans] %d banned player(s) loaded", banCount)
+	}
+
+	blockHistoryMu.RLock()
+	histTotal := 0
+	for _, changes := range blockHistory {
+		histTotal += len(changes)
+	}
+	blockHistoryMu.RUnlock()
+	if histTotal > 0 {
+		log.Printf("[History] %d block change(s) loaded", histTotal)
 	}
 
 	// Start built-in HTTP server for terrain.png
