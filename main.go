@@ -1,9 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/md5"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -12,7 +15,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +36,35 @@ type Config struct {
 	WorldPasswords map[string]string
 	OpPassword     string
 	BannedBlocks   []byte
+	Public         bool
+	MaxPlayers     int
+	VerifyNames    bool
+	TerrainURL     string // URL sent to clients for texture pack
+	HTTPPort       string // port for built-in HTTP server (serves terrain.png)
+	Software       string
 }
 
-var serverConfig Config
+var (
+	serverConfig Config
+	serverSalt   string // random salt for heartbeat / name verification
+)
 
 func hashPassword(password string) string {
 	hash := sha256.Sum256([]byte(password))
 	return hex.EncodeToString(hash[:])
+}
+
+func generateSalt() string {
+	b := make([]byte, 16)
+	crand.Read(b)
+	return hex.EncodeToString(b)[:16]
+}
+
+// verifyPlayerName checks md5(salt + username) == verifyKey.
+// This is the ClassiCube name verification scheme.
+func verifyPlayerName(username, verifyKey string) bool {
+	expected := md5.Sum([]byte(serverSalt + username))
+	return hex.EncodeToString(expected[:]) == verifyKey
 }
 
 func saveConfig() {
@@ -44,6 +72,17 @@ func saveConfig() {
 	buf.WriteString(fmt.Sprintf("ServerName=%s\n", serverConfig.ServerName))
 	buf.WriteString(fmt.Sprintf("Motd=%s\n", serverConfig.Motd))
 	buf.WriteString(fmt.Sprintf("Port=%s\n", strings.TrimPrefix(serverConfig.Port, ":")))
+	buf.WriteString(fmt.Sprintf("Public=%v\n", serverConfig.Public))
+	buf.WriteString(fmt.Sprintf("MaxPlayers=%d\n", serverConfig.MaxPlayers))
+	buf.WriteString(fmt.Sprintf("VerifyNames=%v\n", serverConfig.VerifyNames))
+	buf.WriteString(fmt.Sprintf("Software=%s\n", serverConfig.Software))
+
+	if serverConfig.TerrainURL != "" {
+		buf.WriteString(fmt.Sprintf("TerrainURL=%s\n", serverConfig.TerrainURL))
+	}
+	if serverConfig.HTTPPort != "" {
+		buf.WriteString(fmt.Sprintf("HTTPPort=%s\n", serverConfig.HTTPPort))
+	}
 
 	if serverConfig.OpPassword != "" {
 		buf.WriteString(fmt.Sprintf("OpPassword=%s\n", serverConfig.OpPassword))
@@ -85,6 +124,10 @@ func loadConfig() {
 		Motd:           "Welcome to the server!",
 		Port:           ":25565",
 		WorldPasswords: make(map[string]string),
+		Public:         false,
+		MaxPlayers:     128,
+		VerifyNames:    true,
+		Software:       "GoClassic 1.0",
 	}
 
 	f, err := os.Open("server.properties")
@@ -92,11 +135,11 @@ func loadConfig() {
 		defaultWorldHash := hashPassword("letmein")
 		defaultOpHash := hashPassword("admin")
 
-		defaultProps := fmt.Sprintf("ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\npass_world2=%s\nOpPassword=%s\nBannedBlocks=8,9,10,11\n", defaultWorldHash, defaultOpHash)
+		defaultProps := fmt.Sprintf("ServerName=Go Classic Server\nMotd=Welcome to the server!\nPort=25565\nPublic=false\nMaxPlayers=128\nVerifyNames=true\nSoftware=GoClassic 1.0\n# TerrainURL=http://your-ip:8080/terrain.zip\n# HTTPPort=8080\npass_world2=%s\nOpPassword=%s\nBannedBlocks=8,9,10,11\n", defaultWorldHash, defaultOpHash)
 		os.WriteFile("server.properties", []byte(defaultProps), 0644)
 		serverConfig.WorldPasswords["world2"] = defaultWorldHash
 		serverConfig.OpPassword = defaultOpHash
-		serverConfig.BannedBlocks = []byte{8, 9, 10, 11, 54}
+		serverConfig.BannedBlocks = []byte{8, 9, 10, 11}
 		return
 	}
 	defer f.Close()
@@ -119,6 +162,20 @@ func loadConfig() {
 			serverConfig.Port = ":" + strings.TrimPrefix(val, ":")
 		case "OpPassword":
 			serverConfig.OpPassword = val
+		case "Public":
+			serverConfig.Public = strings.EqualFold(val, "true")
+		case "MaxPlayers":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				serverConfig.MaxPlayers = n
+			}
+		case "VerifyNames":
+			serverConfig.VerifyNames = strings.EqualFold(val, "true")
+		case "TerrainURL":
+			serverConfig.TerrainURL = val
+		case "HTTPPort":
+			serverConfig.HTTPPort = strings.TrimPrefix(val, ":")
+		case "Software":
+			serverConfig.Software = val
 		case "BannedBlocks":
 			for _, bStr := range strings.Split(val, ",") {
 				if b, err := strconv.Atoi(strings.TrimSpace(bStr)); err == nil {
@@ -132,6 +189,175 @@ func loadConfig() {
 			}
 		}
 	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CLASSICUBE HEARTBEAT & SERVER LIST
+// ═══════════════════════════════════════════════════════════════════
+
+func startHeartbeat(server *Server) {
+	if !serverConfig.Public {
+		log.Println("[Heartbeat] Public=false — not sending heartbeats.")
+		return
+	}
+
+	log.Printf("[Heartbeat] Salt=%s — starting heartbeat to classicube.net", serverSalt)
+
+	go func() {
+		ticker := time.NewTicker(45 * time.Second)
+		defer ticker.Stop()
+
+		// Send immediately on start, then every 45s
+		sendHeartbeat(server)
+		for range ticker.C {
+			sendHeartbeat(server)
+		}
+	}()
+}
+
+func sendHeartbeat(server *Server) {
+	server.mu.RLock()
+	playerCount := len(server.players)
+	server.mu.RUnlock()
+
+	port := strings.TrimPrefix(serverConfig.Port, ":")
+
+	params := url.Values{}
+	params.Set("name", serverConfig.ServerName)
+	params.Set("port", port)
+	params.Set("users", strconv.Itoa(playerCount))
+	params.Set("max", strconv.Itoa(serverConfig.MaxPlayers))
+	params.Set("public", "True")
+	params.Set("software", serverConfig.Software)
+	params.Set("salt", serverSalt)
+	params.Set("web", "True")
+
+	// ClassiCube heartbeat accepts GET with query params
+	heartbeatURL := "https://www.classicube.net/server/heartbeat/?" + params.Encode()
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(heartbeatURL)
+	if err != nil {
+		log.Printf("[Heartbeat] Failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	result := strings.TrimSpace(string(body))
+
+	if resp.StatusCode == 200 && strings.HasPrefix(result, "http") {
+		log.Printf("[Heartbeat] Listed — %d player(s) — %s", playerCount, result)
+	} else if resp.StatusCode == 200 {
+		// 200 but no URL means an error message from the server
+		log.Printf("[Heartbeat] Response: %s", result)
+	} else {
+		log.Printf("[Heartbeat] HTTP %d: %s", resp.StatusCode, result)
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BUILT-IN HTTP SERVER (serves terrain.png as .zip for CPE EnvMapAspect)
+// ═══════════════════════════════════════════════════════════════════
+
+var terrainZipCache []byte // cached zip containing terrain.png
+
+func buildTerrainZip() ([]byte, error) {
+	pngData, err := os.ReadFile("terrain.png")
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+
+	fw, err := zw.Create("terrain.png")
+	if err != nil {
+		return nil, err
+	}
+	fw.Write(pngData)
+	zw.Close()
+
+	return buf.Bytes(), nil
+}
+
+func startHTTPServer() {
+	if serverConfig.HTTPPort == "" {
+		return
+	}
+
+	// Look for terrain.png in the current dir or a textures/ subdir
+	terrainPath := "terrain.png"
+	if _, err := os.Stat(terrainPath); os.IsNotExist(err) {
+		terrainPath = filepath.Join("textures", "terrain.png")
+		if _, err := os.Stat(terrainPath); os.IsNotExist(err) {
+			log.Printf("[HTTP] terrain.png not found — HTTP server not started.")
+			log.Printf("[HTTP] Place terrain.png in the server directory to enable.")
+			return
+		}
+	}
+
+	// Pre-build the zip
+	zipData, err := buildTerrainZip()
+	if err != nil {
+		log.Printf("[HTTP] Failed to build terrain.zip: %v", err)
+		return
+	}
+	terrainZipCache = zipData
+	log.Printf("[HTTP] Built terrain.zip (%d bytes) from %s", len(zipData), terrainPath)
+
+	mux := http.NewServeMux()
+
+	// Serve the raw PNG
+	mux.HandleFunc("/terrain.png", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		http.ServeFile(w, r, terrainPath)
+	})
+
+	// Serve the zipped texture pack (ClassiCube EnvMapAspect expects a .zip)
+	mux.HandleFunc("/terrain.zip", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Length", strconv.Itoa(len(terrainZipCache)))
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Write(terrainZipCache)
+	})
+
+	// Reload endpoint so ops can update the texture without restarting
+	mux.HandleFunc("/terrain/reload", func(w http.ResponseWriter, r *http.Request) {
+		newZip, err := buildTerrainZip()
+		if err != nil {
+			http.Error(w, "reload failed: "+err.Error(), 500)
+			return
+		}
+		terrainZipCache = newZip
+		log.Printf("[HTTP] terrain.zip reloaded (%d bytes)", len(newZip))
+		w.Write([]byte("OK"))
+	})
+
+	addr := ":" + serverConfig.HTTPPort
+	log.Printf("[HTTP] Serving terrain on %s (/terrain.png, /terrain.zip)", addr)
+
+	go func() {
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			log.Printf("[HTTP] Server failed: %v", err)
+		}
+	}()
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CPE EnvMapAspect — send texture URL to client
+// ═══════════════════════════════════════════════════════════════════
+
+// sendSetTexturePack sends a CPE SetMapEnvUrl (0x28) packet from
+// the EnvMapAspect extension — this sets the texture pack URL.
+func sendSetTexturePack(conn net.Conn, textureURL string) {
+	pkt := make([]byte, 65)
+	pkt[0] = 0x28
+	copy(pkt[1:65], padString(textureURL))
+	conn.Write(pkt)
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -454,6 +680,54 @@ func savePlayerDB() {
 	os.WriteFile("players.json", data, 0644)
 }
 
+// ── Ban list ─────────────────────────────────────────────────────
+
+type BanEntry struct {
+	Username string `json:"username"`
+	Reason   string `json:"reason"`
+	BannedBy string `json:"banned_by"`
+	Time     string `json:"time"`
+	IP       string `json:"ip"`
+}
+
+var (
+	bannedPlayers = make(map[string]BanEntry) // key = lowercase username
+	banMutex      sync.RWMutex
+)
+
+func loadBanList() {
+	data, err := os.ReadFile("banned.json")
+	if err != nil {
+		return
+	}
+	var list []BanEntry
+	if json.Unmarshal(data, &list) == nil {
+		banMutex.Lock()
+		for _, b := range list {
+			bannedPlayers[strings.ToLower(b.Username)] = b
+		}
+		banMutex.Unlock()
+	}
+}
+
+func saveBanList() {
+	banMutex.RLock()
+	list := make([]BanEntry, 0, len(bannedPlayers))
+	for _, b := range bannedPlayers {
+		list = append(list, b)
+	}
+	banMutex.RUnlock()
+	data, _ := json.MarshalIndent(list, "", "  ")
+	os.WriteFile("banned.json", data, 0644)
+}
+
+func isPlayerBanned(username string) (BanEntry, bool) {
+	banMutex.RLock()
+	defer banMutex.RUnlock()
+	b, ok := bannedPlayers[strings.ToLower(username)]
+	return b, ok
+}
+
 func updatePlayerState(p *Player) {
 	if p.World == nil {
 		return
@@ -694,20 +968,21 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 // ═══════════════════════════════════════════════════════════════════
 
 type Player struct {
-	Conn              net.Conn
-	Username          string
-	World             *World
-	Server            *Server
-	X, Y, Z           int16
-	Yaw, Pitch        byte
-	Authenticated     map[string]bool
-	SavedPasswords    map[string]string
-	PendingWorld      *World
-	SupportsCPE       bool // client negotiated CustomBlocks (ids 50-65 natively)
-	SupportsBlockDefs bool // client negotiated BlockDefinitions CPE extension
-	SupportsHeldBlock bool // client negotiated HeldBlock CPE extension
-	IsOp              bool
-	mu                sync.Mutex
+	Conn                net.Conn
+	Username            string
+	World               *World
+	Server              *Server
+	X, Y, Z             int16
+	Yaw, Pitch          byte
+	Authenticated       map[string]bool
+	SavedPasswords      map[string]string
+	PendingWorld        *World
+	SupportsCPE         bool // client negotiated CustomBlocks (ids 50-65 natively)
+	SupportsBlockDefs   bool // client negotiated BlockDefinitions CPE extension
+	SupportsHeldBlock   bool // client negotiated HeldBlock CPE extension
+	SupportsTexturePack bool // client negotiated EnvMapAspect CPE extension (texture URL)
+	IsOp                bool
+	mu                  sync.Mutex
 }
 
 func (p *Player) SendMessage(msg string) {
@@ -844,6 +1119,11 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 	writeUint8(p.Conn, syaw)
 	writeUint8(p.Conn, spitch)
 
+	// Send texture pack URL after the map is loaded (ClassiCube ignores it before)
+	if p.SupportsTexturePack && serverConfig.TerrainURL != "" {
+		sendSetTexturePack(p.Conn, serverConfig.TerrainURL)
+	}
+
 	updatePlayerState(p)
 
 	welcomePath := "levels/" + target.Name + ".welcome.txt"
@@ -883,11 +1163,33 @@ func handleConnection(conn net.Conn, server *Server) {
 	if username == "" {
 		username = "Player"
 	}
+	verifyKey := strings.TrimRight(string(buf[66:130]), " ")
 
 	cpe := buf[130] == 0x42
 	magic := byte(0x00)
 	if cpe {
 		magic = 0x42
+	}
+
+	// Name verification (when Public + VerifyNames are enabled)
+	if serverConfig.Public && serverConfig.VerifyNames && serverSalt != "" {
+		if !verifyPlayerName(username, verifyKey) {
+			writePacket00(conn, 7, serverConfig.ServerName, "Name verification failed!", 0x00)
+			disconnectPlayer(conn, "&cName verification failed. Join via classicube.net.")
+			return
+		}
+	}
+
+	// Ban check
+	if ban, banned := isPlayerBanned(username); banned {
+		writePacket00(conn, 7, serverConfig.ServerName, "You are banned!", 0x00)
+		reason := "Banned"
+		if ban.Reason != "" {
+			reason = "Banned: " + ban.Reason
+		}
+		disconnectPlayer(conn, "&c"+reason)
+		log.Printf("[Ban] Rejected banned player %s (%s)", username, ban.Reason)
+		return
 	}
 
 	// Server identification MUST be sent before the CPE handshake
@@ -897,12 +1199,13 @@ func handleConnection(conn net.Conn, server *Server) {
 	clientSupportsCustomBlocks := false
 	clientSupportsBlockDefs := false
 	clientSupportsHeldBlock := false
+	clientSupportsTexturePack := false
 
 	if cpe {
-		// Advertise three extensions
+		// Advertise four extensions
 		writeUint8(conn, 0x10) // ExtInfo
 		writeString(conn, serverConfig.ServerName)
-		writeInt16(conn, 3) // 3 extensions
+		writeInt16(conn, 4) // 4 extensions
 
 		writeUint8(conn, 0x11) // ExtEntry 1
 		writeString(conn, "CustomBlocks")
@@ -914,6 +1217,10 @@ func handleConnection(conn net.Conn, server *Server) {
 
 		writeUint8(conn, 0x11) // ExtEntry 3
 		writeString(conn, "HeldBlock")
+		writeInt32(conn, 1)
+
+		writeUint8(conn, 0x11) // ExtEntry 4
+		writeString(conn, "EnvMapAspect")
 		writeInt32(conn, 1)
 
 		// Read the client's extension list
@@ -945,6 +1252,8 @@ func handleConnection(conn net.Conn, server *Server) {
 					clientSupportsBlockDefs = true
 				case "HeldBlock":
 					clientSupportsHeldBlock = true
+				case "EnvMapAspect":
+					clientSupportsTexturePack = true
 				}
 				entriesRead++
 			} else {
@@ -969,14 +1278,15 @@ func handleConnection(conn net.Conn, server *Server) {
 	}
 
 	player := &Player{
-		Conn:              conn,
-		Username:          username,
-		Server:            server,
-		Authenticated:     make(map[string]bool),
-		SavedPasswords:    make(map[string]string),
-		SupportsCPE:       clientSupportsCustomBlocks,
-		SupportsBlockDefs: clientSupportsBlockDefs,
-		SupportsHeldBlock: clientSupportsHeldBlock,
+		Conn:                conn,
+		Username:            username,
+		Server:              server,
+		Authenticated:       make(map[string]bool),
+		SavedPasswords:      make(map[string]string),
+		SupportsCPE:         clientSupportsCustomBlocks,
+		SupportsBlockDefs:   clientSupportsBlockDefs,
+		SupportsHeldBlock:   clientSupportsHeldBlock,
+		SupportsTexturePack: clientSupportsTexturePack,
 	}
 
 	// Push all custom block definitions BEFORE the first map is sent
@@ -984,7 +1294,13 @@ func handleConnection(conn net.Conn, server *Server) {
 		sendAllCustomBlocks(conn)
 	}
 
+	// Enforce max player limit
 	server.mu.Lock()
+	if len(server.players) >= serverConfig.MaxPlayers {
+		server.mu.Unlock()
+		disconnectPlayer(conn, "&cServer is full!")
+		return
+	}
 	server.players[username] = player
 	server.mu.Unlock()
 
@@ -1195,6 +1511,159 @@ func handleConnection(conn net.Conn, server *Server) {
 					lockStr = " &7(locked)"
 				}
 				player.SendMessage(fmt.Sprintf("&aHeld block set to %d.%s", id, lockStr))
+				continue
+			}
+
+			// ── /kick <player> [reason] ──
+			if strings.HasPrefix(msg, "/kick ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /kick.")
+					continue
+				}
+				parts := strings.SplitN(msg, " ", 3)
+				if len(parts) < 2 {
+					player.SendMessage("&cUsage: /kick <player> [reason]")
+					continue
+				}
+				targetName := parts[1]
+				reason := "Kicked by operator"
+				if len(parts) >= 3 {
+					reason = parts[2]
+				}
+
+				server.mu.RLock()
+				target, found := server.players[targetName]
+				server.mu.RUnlock()
+
+				if !found {
+					player.SendMessage("&cPlayer not found: &e" + targetName)
+				} else {
+					disconnectPlayer(target.Conn, "&e"+reason)
+					target.Conn.Close()
+					player.SendMessage("&aKicked &f" + targetName + "&a: " + reason)
+					log.Printf("[Kick] %s kicked %s: %s", player.Username, targetName, reason)
+				}
+				continue
+			}
+
+			// ── /ban <player> [reason] ──
+			if strings.HasPrefix(msg, "/ban ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /ban.")
+					continue
+				}
+				parts := strings.SplitN(msg, " ", 3)
+				if len(parts) < 2 {
+					player.SendMessage("&cUsage: /ban <player> [reason]")
+					continue
+				}
+				targetName := parts[1]
+				reason := ""
+				if len(parts) >= 3 {
+					reason = parts[2]
+				}
+
+				lowerName := strings.ToLower(targetName)
+				if _, already := isPlayerBanned(targetName); already {
+					player.SendMessage("&e" + targetName + " is already banned.")
+					continue
+				}
+
+				// Get the target's IP if they're online
+				targetIP := ""
+				server.mu.RLock()
+				if target, found := server.players[targetName]; found {
+					if addr, ok := target.Conn.RemoteAddr().(*net.TCPAddr); ok {
+						targetIP = addr.IP.String()
+					}
+				}
+				server.mu.RUnlock()
+
+				banMutex.Lock()
+				bannedPlayers[lowerName] = BanEntry{
+					Username: targetName,
+					Reason:   reason,
+					BannedBy: player.Username,
+					Time:     time.Now().Format(time.RFC3339),
+					IP:       targetIP,
+				}
+				banMutex.Unlock()
+				saveBanList()
+
+				// Kick them if online
+				server.mu.RLock()
+				target, found := server.players[targetName]
+				server.mu.RUnlock()
+				if found {
+					kickMsg := "&cBanned"
+					if reason != "" {
+						kickMsg = "&cBanned: " + reason
+					}
+					disconnectPlayer(target.Conn, kickMsg)
+					target.Conn.Close()
+				}
+
+				banMsg := "&aBanned &f" + targetName
+				if reason != "" {
+					banMsg += "&a: " + reason
+				}
+				player.SendMessage(banMsg)
+				log.Printf("[Ban] %s banned %s: %s", player.Username, targetName, reason)
+				continue
+			}
+
+			// ── /unban <player> ──
+			if strings.HasPrefix(msg, "/unban ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /unban.")
+					continue
+				}
+				targetName := strings.TrimPrefix(msg, "/unban ")
+				targetName = strings.TrimSpace(targetName)
+
+				lowerName := strings.ToLower(targetName)
+				banMutex.Lock()
+				_, existed := bannedPlayers[lowerName]
+				if existed {
+					delete(bannedPlayers, lowerName)
+				}
+				banMutex.Unlock()
+
+				if existed {
+					saveBanList()
+					player.SendMessage("&aUnbanned &f" + targetName)
+					log.Printf("[Ban] %s unbanned %s", player.Username, targetName)
+				} else {
+					player.SendMessage("&e" + targetName + " is not banned.")
+				}
+				continue
+			}
+
+			// ── /banlist ──
+			if msg == "/banlist" {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /banlist.")
+					continue
+				}
+				banMutex.RLock()
+				count := len(bannedPlayers)
+				if count == 0 {
+					banMutex.RUnlock()
+					player.SendMessage("&eNo players are banned.")
+					continue
+				}
+				player.SendMessage(fmt.Sprintf("&e--- Banned players (%d) ---", count))
+				for _, b := range bannedPlayers {
+					line := fmt.Sprintf("  &c%s", b.Username)
+					if b.Reason != "" {
+						line += " &7— " + b.Reason
+					}
+					if b.BannedBy != "" {
+						line += " &8(by " + b.BannedBy + ")"
+					}
+					player.SendMessage(line)
+				}
+				banMutex.RUnlock()
 				continue
 			}
 
@@ -1784,6 +2253,9 @@ func (l *LogPlugin) OnPlayerJoin(p *Player, w *World) EventResult {
 		if p.SupportsHeldBlock {
 			cpeStatus += "+HeldBlock"
 		}
+		if p.SupportsTexturePack {
+			cpeStatus += "+EnvMap"
+		}
 	}
 	log.Printf("[Log] %s → joined %q [%s]", p.Username, w.Name, cpeStatus)
 	return EventContinue
@@ -1976,6 +2448,14 @@ func writePacket00(w io.Writer, version byte, name, motd string, magic byte) {
 	w.Write([]byte{magic})
 }
 
+// disconnectPlayer sends a Disconnect (0x0E) packet with a reason message.
+func disconnectPlayer(conn net.Conn, reason string) {
+	pkt := make([]byte, 65)
+	pkt[0] = 0x0E
+	copy(pkt[1:65], padString(reason))
+	conn.Write(pkt)
+}
+
 func padString(s string) []byte {
 	buf := [64]byte{}
 	for i := range buf {
@@ -1998,6 +2478,10 @@ func main() {
 	loadConfig()
 	loadPlayerDB()
 	loadCustomBlocks()
+	loadBanList()
+
+	// Generate a unique salt for this session (used by heartbeat + name verification)
+	serverSalt = generateSalt()
 
 	// Auto-import MCGalaxy global.json if present (merges with customblocks.json)
 	if _, err := os.Stat("global.json"); err == nil {
@@ -2032,7 +2516,7 @@ func main() {
 		world, err := LoadMCGalaxyLevel(path)
 		if err != nil {
 			log.Printf("[World]  %s not found — using generated flat world", path)
-			world = generateFlatWorld(512, 32, 512)
+			world = generateFlatWorld(1024, 16, 1024)
 			SaveMCGalaxyLevel(world, path)
 		}
 		server.AddWorld(name, world)
@@ -2056,12 +2540,35 @@ func main() {
 	customBlocksMu.RUnlock()
 	log.Printf("[Blocks] %d custom block definition(s) loaded", cbCount)
 
+	banMutex.RLock()
+	banCount := len(bannedPlayers)
+	banMutex.RUnlock()
+	if banCount > 0 {
+		log.Printf("[Bans] %d banned player(s) loaded", banCount)
+	}
+
+	// Start built-in HTTP server for terrain.png
+	startHTTPServer()
+
+	// Start ClassiCube server list heartbeat
+	if serverConfig.TerrainURL != "" {
+		log.Printf("[Texture] Clients will download: %s", serverConfig.TerrainURL)
+		if strings.HasSuffix(serverConfig.TerrainURL, ".png") {
+			log.Printf("[Texture] WARNING: ClassiCube expects a .zip URL, not .png")
+			log.Printf("[Texture] Change TerrainURL to end with /terrain.zip")
+		}
+	}
+	startHeartbeat(server)
+
 	ln, err := net.Listen("tcp", serverConfig.Port)
 	if err != nil {
 		log.Fatalf("Failed to listen on %s: %v", serverConfig.Port, err)
 	}
 
-	log.Printf("%s listening on %s", serverConfig.ServerName, serverConfig.Port)
+	log.Printf("%s listening on %s (max %d players)", serverConfig.ServerName, serverConfig.Port, serverConfig.MaxPlayers)
+	if serverConfig.Public {
+		log.Printf("[Heartbeat] Public=true, VerifyNames=%v — listing on classicube.net", serverConfig.VerifyNames)
+	}
 
 	for {
 		conn, err := ln.Accept()
