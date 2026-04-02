@@ -1086,6 +1086,7 @@ type Server struct {
 	worlds  map[string]*World
 	players map[string]*Player
 	plugins []Plugin
+	usedIDs [128]bool // tracks which player IDs (0-127) are in use
 	mu      sync.RWMutex
 }
 
@@ -1093,6 +1094,26 @@ func NewServer() *Server {
 	return &Server{
 		worlds:  make(map[string]*World),
 		players: make(map[string]*Player),
+	}
+}
+
+// allocateID finds the lowest unused player ID (0-127).
+// Must be called with s.mu held for writing.
+func (s *Server) allocateID() byte {
+	for i := 0; i < 128; i++ {
+		if !s.usedIDs[i] {
+			s.usedIDs[i] = true
+			return byte(i)
+		}
+	}
+	return 0 // fallback, shouldn't happen with MaxPlayers <= 128
+}
+
+// freeID releases a player ID back to the pool.
+// Must be called with s.mu held for writing.
+func (s *Server) freeID(id byte) {
+	if id < 128 {
+		s.usedIDs[id] = false
 	}
 }
 
@@ -1122,6 +1143,7 @@ func (s *Server) GetWorld(name string) (*World, bool) {
 
 type Player struct {
 	Conn                net.Conn
+	ID                  byte // unique player ID (0-127), 255 = self
 	Username            string
 	World               *World
 	Server              *Server
@@ -1130,12 +1152,12 @@ type Player struct {
 	Authenticated       map[string]bool
 	SavedPasswords      map[string]string
 	PendingWorld        *World
-	SupportsCPE         bool // client negotiated CustomBlocks (ids 50-65 natively)
-	SupportsBlockDefs   bool // client negotiated BlockDefinitions CPE extension
-	SupportsHeldBlock   bool // client negotiated HeldBlock CPE extension
-	SupportsTexturePack bool // client negotiated EnvMapAspect CPE extension (texture URL)
+	SupportsCPE         bool
+	SupportsBlockDefs   bool
+	SupportsHeldBlock   bool
+	SupportsTexturePack bool
 	IsOp                bool
-	InspectMode         bool // when true, next block click shows history instead of building
+	InspectMode         bool
 	mu                  sync.Mutex
 }
 
@@ -1145,6 +1167,91 @@ func (p *Player) SendMessage(msg string) {
 	pkt[1] = 0xFF
 	copy(pkt[2:], padString(msg))
 	p.Conn.Write(pkt)
+}
+
+// ── Player visibility protocol ───────────────────────────────────
+
+// sendSpawnPlayer sends a Spawn Player (0x07) packet to conn.
+// playerID 255 means "this is you" (the receiving player's own entity).
+func sendSpawnPlayer(conn net.Conn, playerID byte, name string, x, y, z int16, yaw, pitch byte) {
+	pkt := make([]byte, 74)
+	pkt[0] = 0x07
+	pkt[1] = playerID
+	copy(pkt[2:66], padString(name))
+	binary.BigEndian.PutUint16(pkt[66:68], uint16(x))
+	binary.BigEndian.PutUint16(pkt[68:70], uint16(y))
+	binary.BigEndian.PutUint16(pkt[70:72], uint16(z))
+	pkt[72] = yaw
+	pkt[73] = pitch
+	conn.Write(pkt)
+}
+
+// sendDespawnPlayer sends a Despawn Player (0x0C) packet.
+func sendDespawnPlayer(conn net.Conn, playerID byte) {
+	conn.Write([]byte{0x0C, playerID})
+}
+
+// sendPositionUpdate sends a Position/Orientation (0x08) packet for another player.
+func sendPositionUpdate(conn net.Conn, playerID byte, x, y, z int16, yaw, pitch byte) {
+	pkt := make([]byte, 10)
+	pkt[0] = 0x08
+	pkt[1] = playerID
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(x))
+	binary.BigEndian.PutUint16(pkt[4:6], uint16(y))
+	binary.BigEndian.PutUint16(pkt[6:8], uint16(z))
+	pkt[8] = yaw
+	pkt[9] = pitch
+	conn.Write(pkt)
+}
+
+// spawnPlayerInWorld sends Spawn packets: existing players see the new player,
+// and the new player sees all existing players already in the world.
+func (s *Server) spawnPlayerInWorld(p *Player) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, other := range s.players {
+		if other == p || other.World != p.World {
+			continue
+		}
+		// Tell existing player about the new player
+		sendSpawnPlayer(other.Conn, p.ID, p.Username, p.X, p.Y, p.Z, p.Yaw, p.Pitch)
+		// Tell the new player about the existing player
+		sendSpawnPlayer(p.Conn, other.ID, other.Username, other.X, other.Y, other.Z, other.Yaw, other.Pitch)
+	}
+}
+
+// despawnPlayerFromWorld sends Despawn packets to all players in p's current world.
+func (s *Server) despawnPlayerFromWorld(p *Player) {
+	if p.World == nil {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, other := range s.players {
+		if other == p || other.World != p.World {
+			continue
+		}
+		// Tell other players that this player is gone
+		sendDespawnPlayer(other.Conn, p.ID)
+		// Tell the leaving player to remove the other player's model
+		sendDespawnPlayer(p.Conn, other.ID)
+	}
+}
+
+// broadcastPosition sends a player's position/orientation to all other
+// players in the same world.
+func (s *Server) broadcastPosition(p *Player) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, other := range s.players {
+		if other == p || other.World != p.World {
+			continue
+		}
+		sendPositionUpdate(other.Conn, p.ID, p.X, p.Y, p.Z, p.Yaw, p.Pitch)
+	}
 }
 
 // getFallbackBlock returns a vanilla-safe block for non-CPE clients.
@@ -1246,6 +1353,8 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 	}
 
 	if p.World != nil {
+		// Despawn this player from everyone in the old world
+		p.Server.despawnPlayerFromWorld(p)
 		for _, pl := range p.Server.plugins {
 			pl.OnPlayerLeave(p, p.World)
 		}
@@ -1265,18 +1374,16 @@ func (p *Player) ChangeWorld(target *World, useSavedPos bool) {
 		p.Yaw, p.Pitch = syaw, spitch
 	}
 
-	writeUint8(p.Conn, 0x08)
-	writeUint8(p.Conn, 255)
-	writeInt16(p.Conn, sx)
-	writeInt16(p.Conn, sy)
-	writeInt16(p.Conn, sz)
-	writeUint8(p.Conn, syaw)
-	writeUint8(p.Conn, spitch)
+	// Spawn self (ID 255 = "this is you")
+	sendSpawnPlayer(p.Conn, 255, p.Username, sx, sy, sz, syaw, spitch)
 
 	// Send texture pack URL after the map is loaded (ClassiCube ignores it before)
 	if p.SupportsTexturePack && serverConfig.TerrainURL != "" {
 		sendSetTexturePack(p.Conn, serverConfig.TerrainURL)
 	}
+
+	// Spawn other players in this world for us, and us for them
+	p.Server.spawnPlayerInWorld(p)
 
 	updatePlayerState(p)
 
@@ -1448,20 +1555,26 @@ func handleConnection(conn net.Conn, server *Server) {
 		sendAllCustomBlocks(conn)
 	}
 
-	// Enforce max player limit
+	// Enforce max player limit and allocate a unique ID
 	server.mu.Lock()
 	if len(server.players) >= serverConfig.MaxPlayers {
 		server.mu.Unlock()
 		disconnectPlayer(conn, "&cServer is full!")
 		return
 	}
+	player.ID = server.allocateID()
 	server.players[username] = player
 	server.mu.Unlock()
 
 	defer func() {
+		// Despawn from all players in the same world
+		server.despawnPlayerFromWorld(player)
+
 		server.mu.Lock()
+		server.freeID(player.ID)
 		delete(server.players, username)
 		server.mu.Unlock()
+
 		if player.World != nil {
 			for _, pl := range server.plugins {
 				pl.OnPlayerLeave(player, player.World)
@@ -1591,6 +1704,9 @@ func handleConnection(conn net.Conn, server *Server) {
 			player.Y = int16(binary.BigEndian.Uint16(data[3:5]))
 			player.Z = int16(binary.BigEndian.Uint16(data[5:7]))
 			player.Yaw, player.Pitch = data[7], data[8]
+
+			// Broadcast our position to all other players in the same world
+			server.broadcastPosition(player)
 
 			for _, pl := range server.plugins {
 				pl.OnPlayerMove(player, player.X, player.Y, player.Z, player.Yaw, player.Pitch)
