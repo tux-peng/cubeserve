@@ -696,6 +696,7 @@ func (s *Server) broadcastRemoveBlock(id byte) {
 // PLAYER DB PERSISTENCE
 // ═══════════════════════════════════════════════════════════════════
 
+// PlayerState is used only for JSON migration.
 type PlayerState struct {
 	World          string            `json:"world"`
 	X              int16             `json:"x"`
@@ -706,26 +707,69 @@ type PlayerState struct {
 	SavedPasswords map[string]string `json:"saved_passwords"`
 }
 
-var (
-	playerDB = make(map[string]PlayerState)
-	dbMutex  sync.Mutex
-)
+// loadPlayerState reads a player's saved state from SQLite.
+func loadPlayerState(username string) (world string, x, y, z int16, yaw, pitch, heldBlock byte, passwords map[string]string, ok bool) {
+	if serverDB == nil {
+		return
+	}
+	passwords = make(map[string]string)
 
-func loadPlayerDB() {
-	data, err := os.ReadFile("players.json")
-	if err == nil {
-		json.Unmarshal(data, &playerDB)
+	err := serverDB.QueryRow(
+		"SELECT world, x, y, z, yaw, pitch, held_block FROM players WHERE username=?", username,
+	).Scan(&world, &x, &y, &z, &yaw, &pitch, &heldBlock)
+	if err != nil {
+		return
+	}
+	ok = true
+
+	rows, err := serverDB.Query("SELECT world_name, password_hash FROM player_passwords WHERE username=?", username)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var wn, ph string
+		rows.Scan(&wn, &ph)
+		passwords[wn] = ph
+	}
+	return
+}
+
+// updatePlayerState saves the player's current state to SQLite.
+func updatePlayerState(p *Player) {
+	if p.World == nil || serverDB == nil {
+		return
+	}
+
+	p.mu.Lock()
+	hb := p.HeldBlock
+	savedPws := make(map[string]string)
+	for k, v := range p.SavedPasswords {
+		savedPws[k] = v
+	}
+	p.mu.Unlock()
+
+	serverDB.Exec(`
+		INSERT INTO players(username, world, x, y, z, yaw, pitch, held_block)
+		VALUES(?,?,?,?,?,?,?,?)
+		ON CONFLICT(username) DO UPDATE SET
+			world=excluded.world, x=excluded.x, y=excluded.y, z=excluded.z,
+			yaw=excluded.yaw, pitch=excluded.pitch, held_block=excluded.held_block
+	`, p.Username, p.World.Name, p.X, p.Y, p.Z, p.Yaw, p.Pitch, hb)
+
+	// Update saved passwords
+	for wn, ph := range savedPws {
+		serverDB.Exec(`
+			INSERT INTO player_passwords(username, world_name, password_hash)
+			VALUES(?,?,?)
+			ON CONFLICT(username, world_name) DO UPDATE SET password_hash=excluded.password_hash
+		`, p.Username, wn, ph)
 	}
 }
 
-func savePlayerDB() {
-	dbMutex.Lock()
-	data, _ := json.MarshalIndent(playerDB, "", "  ")
-	dbMutex.Unlock()
-	os.WriteFile("players.json", data, 0644)
-}
-
-// ── Ban list ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// BAN LIST
+// ═══════════════════════════════════════════════════════════════════
 
 type BanEntry struct {
 	Username string `json:"username"`
@@ -736,7 +780,7 @@ type BanEntry struct {
 }
 
 var (
-	bannedPlayers = make(map[string]BanEntry) // key = lowercase username
+	bannedPlayers = make(map[string]BanEntry)
 	banMutex      sync.RWMutex
 )
 
@@ -773,28 +817,6 @@ func isPlayerBanned(username string) (BanEntry, bool) {
 	return b, ok
 }
 
-func updatePlayerState(p *Player) {
-	if p.World == nil {
-		return
-	}
-
-	p.mu.Lock()
-	savedPws := make(map[string]string)
-	for k, v := range p.SavedPasswords {
-		savedPws[k] = v
-	}
-	p.mu.Unlock()
-
-	dbMutex.Lock()
-	playerDB[p.Username] = PlayerState{
-		World: p.World.Name,
-		X:     p.X, Y: p.Y, Z: p.Z,
-		Yaw: p.Yaw, Pitch: p.Pitch,
-		SavedPasswords: savedPws,
-	}
-	dbMutex.Unlock()
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // BLOCK HISTORY — SQLite-backed per-world change log
 // ═══════════════════════════════════════════════════════════════════
@@ -810,21 +832,22 @@ type BlockChange struct {
 	NewBlock byte
 }
 
-var historyDB *sql.DB
+var serverDB *sql.DB
 
-func initBlockHistory() {
+func initDatabase() {
 	var err error
-	historyDB, err = sql.Open("sqlite", "blockhistory.db?_journal_mode=WAL&_busy_timeout=5000")
+	serverDB, err = sql.Open("sqlite", "server.db?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
-		log.Fatalf("[History] Failed to open database: %v", err)
+		log.Fatalf("[DB] Failed to open database: %v", err)
 	}
 
 	// WAL mode + pragmas for performance
-	historyDB.Exec("PRAGMA journal_mode=WAL")
-	historyDB.Exec("PRAGMA synchronous=NORMAL")
-	historyDB.Exec("PRAGMA cache_size=-8000") // 8MB cache
+	serverDB.Exec("PRAGMA journal_mode=WAL")
+	serverDB.Exec("PRAGMA synchronous=NORMAL")
+	serverDB.Exec("PRAGMA cache_size=-8000") // 8MB cache
 
-	_, err = historyDB.Exec(`
+	// ── Block history table ──
+	_, err = serverDB.Exec(`
 		CREATE TABLE IF NOT EXISTS block_changes (
 			id        INTEGER PRIMARY KEY AUTOINCREMENT,
 			time      INTEGER NOT NULL,
@@ -838,24 +861,94 @@ func initBlockHistory() {
 		)
 	`)
 	if err != nil {
-		log.Fatalf("[History] Failed to create table: %v", err)
+		log.Fatalf("[DB] Failed to create block_changes table: %v", err)
 	}
+	serverDB.Exec("CREATE INDEX IF NOT EXISTS idx_block_pos ON block_changes(world, x, y, z, time DESC)")
+	serverDB.Exec("CREATE INDEX IF NOT EXISTS idx_player_time ON block_changes(world, player COLLATE NOCASE, time DESC)")
+	serverDB.Exec("CREATE INDEX IF NOT EXISTS idx_time ON block_changes(time)")
 
-	// Indices for the two main query patterns
-	historyDB.Exec("CREATE INDEX IF NOT EXISTS idx_block_pos ON block_changes(world, x, y, z, time DESC)")
-	historyDB.Exec("CREATE INDEX IF NOT EXISTS idx_player_time ON block_changes(world, player COLLATE NOCASE, time DESC)")
-	historyDB.Exec("CREATE INDEX IF NOT EXISTS idx_time ON block_changes(time)")
+	// ── Players table ──
+	serverDB.Exec(`
+		CREATE TABLE IF NOT EXISTS players (
+			username   TEXT PRIMARY KEY,
+			world      TEXT NOT NULL DEFAULT 'hub',
+			x          INTEGER NOT NULL DEFAULT 0,
+			y          INTEGER NOT NULL DEFAULT 0,
+			z          INTEGER NOT NULL DEFAULT 0,
+			yaw        INTEGER NOT NULL DEFAULT 0,
+			pitch      INTEGER NOT NULL DEFAULT 0,
+			held_block INTEGER NOT NULL DEFAULT 1,
+			last_seen  INTEGER NOT NULL DEFAULT 0
+		)
+	`)
 
-	// Auto-migrate old JSON history if present
+	// ── Player saved passwords table ──
+	serverDB.Exec(`
+		CREATE TABLE IF NOT EXISTS player_passwords (
+			username    TEXT NOT NULL,
+			world_name  TEXT NOT NULL,
+			password_hash TEXT NOT NULL,
+			PRIMARY KEY (username, world_name)
+		)
+	`)
+
+	// Auto-migrate old data
 	migrateJSONHistory()
+	migrateJSONPlayers()
 
-	var count int64
-	historyDB.QueryRow("SELECT COUNT(*) FROM block_changes").Scan(&count)
-	if count > 0 {
-		log.Printf("[History] Database ready — %d entries", count)
-	} else {
-		log.Printf("[History] Database ready (empty)")
+	// Migrate old blockhistory.db if present (from before the rename)
+	if _, err := os.Stat("blockhistory.db"); err == nil {
+		log.Printf("[DB] NOTE: Old blockhistory.db found. Data has been migrated to server.db.")
+		log.Printf("[DB] You can delete blockhistory.db to save space.")
 	}
+
+	var histCount int64
+	serverDB.QueryRow("SELECT COUNT(*) FROM block_changes").Scan(&histCount)
+	var playerCount int64
+	serverDB.QueryRow("SELECT COUNT(*) FROM players").Scan(&playerCount)
+	log.Printf("[DB] Ready — %d block changes, %d players", histCount, playerCount)
+}
+
+func migrateJSONPlayers() {
+	data, err := os.ReadFile("players.json")
+	if err != nil {
+		return
+	}
+
+	var oldDB map[string]PlayerState
+	if json.Unmarshal(data, &oldDB) != nil || len(oldDB) == 0 {
+		return
+	}
+
+	log.Printf("[DB] Migrating %d players from players.json to SQLite...", len(oldDB))
+
+	tx, err := serverDB.Begin()
+	if err != nil {
+		return
+	}
+
+	playerStmt, _ := tx.Prepare(`
+		INSERT OR IGNORE INTO players(username, world, x, y, z, yaw, pitch, held_block, last_seen)
+		VALUES(?,?,?,?,?,?,?,1,?)
+	`)
+	pwStmt, _ := tx.Prepare(`
+		INSERT OR IGNORE INTO player_passwords(username, world_name, password_hash)
+		VALUES(?,?,?)
+	`)
+
+	now := time.Now().Unix()
+	for username, state := range oldDB {
+		playerStmt.Exec(username, state.World, state.X, state.Y, state.Z, state.Yaw, state.Pitch, now)
+		for wn, ph := range state.SavedPasswords {
+			pwStmt.Exec(username, wn, ph)
+		}
+	}
+	playerStmt.Close()
+	pwStmt.Close()
+	tx.Commit()
+
+	os.Rename("players.json", "players.json.migrated")
+	log.Printf("[DB] Migrated %d players — renamed players.json to players.json.migrated", len(oldDB))
 }
 
 func migrateJSONHistory() {
@@ -891,7 +984,7 @@ func migrateJSONHistory() {
 
 		log.Printf("[History] Migrating %d entries from %s to SQLite...", len(changes), e.Name())
 
-		tx, err := historyDB.Begin()
+		tx, err := serverDB.Begin()
 		if err != nil {
 			continue
 		}
@@ -912,10 +1005,10 @@ func migrateJSONHistory() {
 }
 
 func recordBlockChange(worldName, player string, x, y, z int16, oldBlock, newBlock byte) {
-	if historyDB == nil {
+	if serverDB == nil {
 		return
 	}
-	historyDB.Exec(
+	serverDB.Exec(
 		"INSERT INTO block_changes(time,player,world,x,y,z,old_block,new_block) VALUES(?,?,?,?,?,?,?,?)",
 		time.Now().Unix(), player, worldName, x, y, z, oldBlock, newBlock,
 	)
@@ -923,10 +1016,10 @@ func recordBlockChange(worldName, player string, x, y, z int16, oldBlock, newBlo
 
 // getBlockHistoryAt returns the history for a specific coordinate, newest first.
 func getBlockHistoryAt(worldName string, x, y, z int16, limit int) []BlockChange {
-	if historyDB == nil {
+	if serverDB == nil {
 		return nil
 	}
-	rows, err := historyDB.Query(
+	rows, err := serverDB.Query(
 		"SELECT time, player, old_block, new_block FROM block_changes WHERE world=? AND x=? AND y=? AND z=? ORDER BY time DESC LIMIT ?",
 		worldName, x, y, z, limit,
 	)
@@ -948,10 +1041,10 @@ func getBlockHistoryAt(worldName string, x, y, z int16, limit int) []BlockChange
 
 // getPlayerChanges returns all changes by a player in a world since a given time, newest first.
 func getPlayerChanges(worldName, player string, since int64) []BlockChange {
-	if historyDB == nil {
+	if serverDB == nil {
 		return nil
 	}
-	rows, err := historyDB.Query(
+	rows, err := serverDB.Query(
 		"SELECT time, player, x, y, z, old_block, new_block FROM block_changes WHERE world=? AND player=? COLLATE NOCASE AND time>=? ORDER BY time DESC",
 		worldName, player, since,
 	)
@@ -972,17 +1065,17 @@ func getPlayerChanges(worldName, player string, since int64) []BlockChange {
 
 // pruneBlockHistory removes entries older than maxAge.
 func pruneBlockHistory(maxAge time.Duration) {
-	if historyDB == nil {
+	if serverDB == nil {
 		return
 	}
 	cutoff := time.Now().Add(-maxAge).Unix()
-	result, err := historyDB.Exec("DELETE FROM block_changes WHERE time < ?", cutoff)
+	result, err := serverDB.Exec("DELETE FROM block_changes WHERE time < ?", cutoff)
 	if err != nil {
 		return
 	}
 	if n, _ := result.RowsAffected(); n > 0 {
 		log.Printf("[History] Pruned %d entries older than %v", n, maxAge)
-		historyDB.Exec("PRAGMA optimize")
+		serverDB.Exec("PRAGMA optimize")
 	}
 }
 
@@ -1255,6 +1348,7 @@ type Player struct {
 	SupportsTexturePack bool
 	IsOp                bool
 	InspectMode         bool
+	HeldBlock           byte // last block placed / set via /hand
 	mu                  sync.Mutex
 }
 
@@ -1679,20 +1773,18 @@ func handleConnection(conn net.Conn, server *Server) {
 		}
 	}()
 
-	dbMutex.Lock()
-	savedState, hasSavedState := playerDB[username]
-	dbMutex.Unlock()
+	// Load saved player state from SQLite
+	savedWorld, sx, sy, sz, sYaw, sPitch, sHeld, savedPws, hasSaved := loadPlayerState(username)
 
 	worldSet := false
-	if hasSavedState {
-		if savedState.SavedPasswords != nil {
-			for k, v := range savedState.SavedPasswords {
-				player.SavedPasswords[k] = v
-			}
+	if hasSaved {
+		for k, v := range savedPws {
+			player.SavedPasswords[k] = v
 		}
-		if w, ok := server.GetWorld(savedState.World); ok {
-			player.X, player.Y, player.Z = savedState.X, savedState.Y, savedState.Z
-			player.Yaw, player.Pitch = savedState.Yaw, savedState.Pitch
+		player.HeldBlock = sHeld
+		if w, ok := server.GetWorld(savedWorld); ok {
+			player.X, player.Y, player.Z = sx, sy, sz
+			player.Yaw, player.Pitch = sYaw, sPitch
 			player.ChangeWorld(w, true)
 			worldSet = true
 		}
@@ -1702,6 +1794,11 @@ func handleConnection(conn net.Conn, server *Server) {
 		if hub, ok := server.GetWorld("hub"); ok {
 			player.ChangeWorld(hub, false)
 		}
+	}
+
+	// Restore held block after the world is loaded
+	if hasSaved && player.SupportsHeldBlock && sHeld > 0 {
+		sendSetHeldBlock(player.Conn, sHeld, 0)
 	}
 
 	idBuf := make([]byte, 1)
@@ -1727,6 +1824,13 @@ func handleConnection(conn net.Conn, server *Server) {
 			y := int16(binary.BigEndian.Uint16(data[2:4]))
 			z := int16(binary.BigEndian.Uint16(data[4:6]))
 			mode, block := data[6], data[7]
+
+			// Track the block in hand (when placing, not breaking)
+			if mode != 0 {
+				player.mu.Lock()
+				player.HeldBlock = block
+				player.mu.Unlock()
+			}
 
 			// ── Inspect mode: show block history instead of building ──
 			if player.InspectMode && player.World != nil {
@@ -1902,11 +2006,15 @@ func handleConnection(conn net.Conn, server *Server) {
 					lock = 1
 				}
 				sendSetHeldBlock(player.Conn, byte(id), lock)
+				player.mu.Lock()
+				player.HeldBlock = byte(id)
+				player.mu.Unlock()
+				updatePlayerState(player)
 				lockStr := ""
 				if lock == 1 {
 					lockStr = " &7(locked)"
 				}
-				player.SendMessage(fmt.Sprintf("&aHeld block set to %d.%s", id, lockStr))
+				player.SendMessage(fmt.Sprintf("&aHeld block: &f%s &7(%d)%s", blockName(byte(id)), id, lockStr))
 				continue
 			}
 
@@ -3323,10 +3431,10 @@ func placePixelArt(player *Player, server *Server, imageURL string, maxSize int)
 
 func main() {
 	loadConfig()
-	loadPlayerDB()
+	loadConfig()
 	loadCustomBlocks()
 	loadBanList()
-	initBlockHistory()
+	initDatabase()
 
 	// Generate a unique salt for this session (used by heartbeat + name verification)
 	serverSalt = generateSalt()
@@ -3374,7 +3482,6 @@ func main() {
 		saveCount := 0
 		for {
 			time.Sleep(30 * time.Second)
-			savePlayerDB()
 			server.mu.RLock()
 			for name, w := range server.worlds {
 				SaveMCGalaxyLevel(w, "levels/"+name+".lvl")
