@@ -12,8 +12,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -2051,6 +2056,30 @@ func handleConnection(conn net.Conn, server *Server) {
 				continue
 			}
 
+			// ── /pixelart <url> [maxsize] — Generate pixel art from image ──
+			if strings.HasPrefix(msg, "/pixelart ") {
+				if !player.IsOp {
+					player.SendMessage("&cYou must be an operator to use /pixelart.")
+					continue
+				}
+				parts := strings.Fields(msg)
+				if len(parts) < 2 {
+					player.SendMessage("&cUsage: /pixelart <url> [maxsize]")
+					player.SendMessage("&7Faces the direction you're looking. Max size default: 64")
+					continue
+				}
+				imageURL := parts[1]
+				maxSize := 64
+				if len(parts) >= 3 {
+					if n, err := strconv.Atoi(parts[2]); err == nil && n > 0 && n <= 256 {
+						maxSize = n
+					}
+				}
+				// Run in background so it doesn't block the player's connection
+				go placePixelArt(player, server, imageURL, maxSize)
+				continue
+			}
+
 			// ── /goto ──
 			if strings.HasPrefix(msg, "/goto ") {
 				name := strings.TrimPrefix(msg, "/goto ")
@@ -2853,6 +2882,347 @@ func writeUint8(w io.Writer, b byte)    { w.Write([]byte{b}) }
 func writeInt16(w io.Writer, i int16)   { binary.Write(w, binary.BigEndian, i) }
 func writeInt32(w io.Writer, i int32)   { binary.Write(w, binary.BigEndian, i) }
 func writeString(w io.Writer, s string) { w.Write(padString(s)) }
+
+// ═══════════════════════════════════════════════════════════════════
+// PIXEL ART GENERATOR — /pixelart <url> [maxsize]
+// ═══════════════════════════════════════════════════════════════════
+
+type blockColor struct {
+	ID byte
+	R  uint8
+	G  uint8
+	B  uint8
+}
+
+// blockPalette maps block IDs to their representative RGB color.
+// Includes vanilla Classic blocks and the custom Crayola wool blocks.
+var blockPalette = []blockColor{
+	// ── Vanilla blocks ──
+	{1, 125, 125, 125},  // Stone
+	{3, 134, 96, 67},    // Dirt
+	{4, 115, 115, 115},  // Cobblestone
+	{5, 188, 152, 98},   // Planks
+	{12, 218, 210, 158}, // Sand
+	{17, 155, 125, 76},  // Log
+	{20, 175, 213, 236}, // Glass (light blue tint)
+	{21, 163, 45, 45},   // Red Wool
+	{22, 217, 131, 58},  // Orange Wool
+	{23, 177, 166, 39},  // Yellow Wool
+	{24, 65, 174, 56},   // Lime Wool
+	{25, 40, 117, 47},   // Green Wool
+	{26, 40, 117, 107},  // Teal Wool
+	{27, 58, 82, 165},   // Aqua Wool
+	{28, 57, 64, 194},   // Cyan Wool (Blue)
+	{29, 95, 54, 164},   // Indigo Wool
+	{30, 126, 61, 181},  // Violet Wool
+	{31, 172, 74, 181},  // Magenta Wool
+	{32, 208, 132, 153}, // Pink Wool
+	{33, 27, 27, 27},    // Black Wool
+	{34, 157, 157, 157}, // Gray Wool
+	{35, 255, 255, 255}, // White Wool
+	{36, 223, 223, 223}, // Light Gray Wool
+	{41, 231, 165, 45},  // Gold Block
+	{42, 191, 191, 191}, // Iron Block (silver)
+	{43, 175, 175, 175}, // Double Slab
+	{44, 175, 175, 175}, // Slab
+	{45, 155, 93, 83},   // Brick
+	// ── Custom Crayola wool blocks ──
+	{102, 239, 222, 205}, // Almond
+	{103, 253, 217, 181}, // Apricot
+	{104, 253, 114, 114}, // Bittersweet
+	{105, 222, 93, 131},  // Blush
+	{106, 203, 65, 84},   // Brick Red
+	{107, 255, 170, 204}, // Carnation Pink
+	{108, 221, 68, 146},  // Cerise
+	{109, 188, 93, 88},   // Chestnut
+	{110, 202, 55, 103},  // Jazzberry Jam
+	{111, 205, 74, 76},   // Mahogany
+	{112, 255, 130, 67},  // Mango Tango
+	{113, 239, 152, 170}, // Mauvelous
+	{114, 253, 188, 180}, // Melon
+	{115, 255, 207, 171}, // Peach
+	{116, 252, 116, 253}, // Pink Flamingo
+	{117, 247, 143, 167}, // Pink Sherbert
+	{118, 195, 100, 197}, // Fuchsia
+	{186, 255, 53, 94},   // Radical Red
+	{119, 227, 37, 107},  // Razzmatazz
+	{120, 238, 32, 77},   // Red
+	{121, 255, 155, 170}, // Salmon
+	{122, 252, 40, 71},   // Scarlet
+	{123, 253, 94, 83},   // Sunset Orange
+	{124, 252, 137, 172}, // Tickle Me Pink
+	{125, 247, 83, 148},  // Violet Red
+	{126, 255, 67, 164},  // Wild Strawberry
+	{127, 255, 164, 116}, // Atomic Tangerine
+	{128, 255, 127, 73},  // Burnt Orange
+	{129, 234, 126, 93},  // Burnt Sienna
+	{130, 184, 115, 51},  // Copper
+	{131, 255, 189, 136}, // Macaroni And Cheese
+	{132, 255, 163, 67},  // Neon Carrot
+	{133, 255, 117, 56},  // Orange
+	{134, 255, 110, 74},  // Outrageous Orange
+	{135, 255, 83, 73},   // Red Orange
+	{136, 222, 170, 136}, // Tumbleweed
+	{137, 255, 160, 137}, // Vivid Tangerine
+	{138, 250, 231, 181}, // Banana Mania
+	{139, 255, 255, 153}, // Canary
+	{140, 253, 219, 109}, // Dandelion
+	{141, 239, 205, 184}, // Desert Sand
+	{142, 231, 198, 151}, // Gold
+	{143, 252, 214, 103}, // Goldenrod
+	{144, 253, 252, 116}, // Laser Lemon
+	{145, 255, 207, 72},  // Sunglow
+	{146, 250, 167, 108}, // Tan
+	{147, 253, 252, 116}, // Unmellow Yellow
+	{148, 252, 232, 131}, // Yellow
+	{149, 255, 182, 83},  // Yellow Orange
+	{150, 206, 255, 29},  // Electric Lime
+	{151, 240, 232, 145}, // Green Yellow
+	{152, 178, 236, 93},  // Inchworm
+	{153, 186, 184, 108}, // Olive Green
+	{154, 236, 235, 189}, // Spring Green
+	{155, 197, 227, 132}, // Yellow Green
+	{156, 135, 169, 107}, // Asparagus
+	{157, 113, 188, 120}, // Fern
+	{158, 109, 174, 129}, // Forest Green
+	{159, 168, 228, 160}, // Granny Smith Apple
+	{160, 28, 172, 120},  // Green
+	{161, 59, 176, 143},  // Jungle Green
+	{162, 30, 168, 132},  // Mountain Meadow
+	{163, 21, 128, 120},  // Pine Green
+	{164, 118, 255, 122}, // Screamin Green
+	{165, 147, 223, 184}, // Sea Green
+	{166, 69, 206, 162},  // Shamrock
+	{167, 23, 128, 109},  // Tropical Rain Forest
+	{168, 120, 219, 226}, // Aquamarine
+	{169, 31, 117, 254},  // Blue
+	{170, 13, 152, 186},  // Blue Green
+	{171, 28, 211, 162},  // Caribbean Green
+	{172, 29, 172, 214},  // Cerulean
+	{173, 154, 206, 235}, // Cornflower
+	{174, 43, 108, 196},  // Denim
+	{175, 0, 51, 100},    // Midnight Blue
+	{176, 25, 116, 210},  // Navy Blue
+	{177, 28, 169, 201},  // Pacific Blue
+	{178, 31, 206, 203},  // Robin's Egg Blue
+	{179, 128, 218, 235}, // Sky Blue
+	{180, 219, 215, 210}, // Timberwolf
+	{181, 119, 221, 231}, // Turquoise Blue
+	{182, 162, 162, 208}, // Blue Bell
+	{183, 115, 102, 189}, // Blue Violet
+	{184, 176, 183, 198}, // Cadet Blue
+	{185, 110, 81, 96},   // Eggplant
+	// 186 = Radical Red (already above)
+	{187, 93, 118, 203},  // Indigo
+	{188, 252, 180, 213}, // Lavender
+	{189, 151, 154, 170}, // Manatee
+	{190, 197, 75, 140},  // Mulberry
+	{191, 230, 168, 215}, // Orchid
+	{192, 65, 74, 76},    // Outer Space
+	{193, 197, 208, 230}, // Periwinkle
+	{194, 142, 69, 133},  // Plum
+	{195, 116, 66, 200},  // Purple Heart
+	{196, 157, 129, 186}, // Purple Mountain Majesty
+	{197, 254, 78, 218},  // Purple Pizzazz
+	{198, 255, 72, 208},  // Razzle Dazzle Rose
+	{199, 192, 68, 143},  // Red Violet
+	{200, 120, 81, 169},  // Royal Purple
+	{201, 251, 126, 253}, // Shocking Pink
+	{202, 235, 199, 223}, // Thistle
+	{203, 143, 80, 157},  // Vivid Violet
+	{204, 146, 110, 174}, // Violet (Purple)
+	{205, 162, 173, 208}, // Wild Blue Yonder
+	{206, 205, 164, 222}, // Wisteria
+	{207, 255, 29, 206},  // Hot Magenta
+	{208, 246, 100, 175}, // Magenta
+	{209, 252, 108, 133}, // Wild Watermelon
+	{210, 205, 149, 117}, // Antique Brass
+	{211, 172, 229, 238}, // Blizzard Blue
+	{212, 200, 56, 90},   // Maroon
+	{213, 165, 105, 79},  // Sepia
+	{214, 138, 121, 93},  // Shadow
+	{215, 159, 129, 112}, // Beaver
+	{216, 35, 35, 35},    // Black
+	{217, 180, 103, 77},  // Brown
+	{218, 204, 102, 102}, // Fuzzy Wuzzy
+	{219, 149, 145, 140}, // Gray
+	{220, 205, 197, 194}, // Silver
+	{221, 237, 237, 237}, // White
+}
+
+func nearestBlock(r, g, b uint8) byte {
+	best := byte(35) // default white
+	bestDist := math.MaxFloat64
+
+	for _, bc := range blockPalette {
+		dr := float64(int(r) - int(bc.R))
+		dg := float64(int(g) - int(bc.G))
+		db := float64(int(b) - int(bc.B))
+		// Weighted Euclidean — human eyes are more sensitive to green
+		dist := 2*dr*dr + 4*dg*dg + 3*db*db
+		if dist < bestDist {
+			bestDist = dist
+			best = bc.ID
+		}
+	}
+	return best
+}
+
+// scaleImage does nearest-neighbor resize to fit within maxW × maxH.
+func scaleImage(src image.Image, maxW, maxH int) image.Image {
+	bounds := src.Bounds()
+	srcW := bounds.Dx()
+	srcH := bounds.Dy()
+
+	if srcW <= maxW && srcH <= maxH {
+		return src
+	}
+
+	scale := math.Min(float64(maxW)/float64(srcW), float64(maxH)/float64(srcH))
+	dstW := int(math.Max(1, math.Round(float64(srcW)*scale)))
+	dstH := int(math.Max(1, math.Round(float64(srcH)*scale)))
+
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	for y := 0; y < dstH; y++ {
+		srcY := int(float64(y) / scale)
+		if srcY >= srcH {
+			srcY = srcH - 1
+		}
+		for x := 0; x < dstW; x++ {
+			srcX := int(float64(x) / scale)
+			if srcX >= srcW {
+				srcX = srcW - 1
+			}
+			dst.Set(x, y, src.At(bounds.Min.X+srcX, bounds.Min.Y+srcY))
+		}
+	}
+	return dst
+}
+
+// placePixelArt downloads an image from url, scales it, and places it
+// in the world as a vertical wall facing the player's direction.
+func placePixelArt(player *Player, server *Server, imageURL string, maxSize int) {
+	player.SendMessage("&eDownloading image...")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest("GET", imageURL, nil)
+	if err != nil {
+		player.SendMessage("&cBad URL: " + err.Error())
+		return
+	}
+	req.Header.Set("User-Agent", "GoClassic/1.0")
+	resp, err := client.Do(req)
+	if err != nil {
+		player.SendMessage("&cDownload failed: " + err.Error())
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		player.SendMessage(fmt.Sprintf("&cHTTP %d from server.", resp.StatusCode))
+		return
+	}
+
+	// Limit download to 10MB
+	limitedBody := io.LimitReader(resp.Body, 10*1024*1024)
+	img, _, err := image.Decode(limitedBody)
+	if err != nil {
+		player.SendMessage("&cFailed to decode image: " + err.Error())
+		return
+	}
+
+	scaled := scaleImage(img, maxSize, maxSize)
+	bounds := scaled.Bounds()
+	imgW := bounds.Dx()
+	imgH := bounds.Dy()
+
+	player.SendMessage(fmt.Sprintf("&ePlacing %dx%d pixel art...", imgW, imgH))
+
+	if player.World == nil {
+		player.SendMessage("&cYou must be in a world.")
+		return
+	}
+
+	// Check world bounds
+	w := player.World
+	if imgW > int(w.Width) || imgH > int(w.Height) {
+		player.SendMessage("&cImage is too large for this world.")
+		return
+	}
+
+	// Determine facing direction from yaw to decide which axis to paint on.
+	// Yaw: 0=south(+Z), 64=west(-X), 128=north(-Z), 192=east(+X)
+	bx := int(player.X / 32)
+	by := int(player.Y/32) - 1 // feet level
+	bz := int(player.Z / 32)
+
+	yaw := player.Yaw
+	type direction struct{ dx, dz int }
+	var faceDir direction // direction we step across for columns
+	var placeOnZ bool     // true = wall runs along X axis, false = along Z axis
+
+	switch {
+	case yaw < 32 || yaw >= 224: // facing south (+Z)
+		faceDir = direction{1, 0}
+		bz += 2
+		placeOnZ = false
+	case yaw >= 32 && yaw < 96: // facing west (-X)
+		faceDir = direction{0, 1}
+		bx -= 2
+		placeOnZ = true
+	case yaw >= 96 && yaw < 160: // facing north (-Z)
+		faceDir = direction{-1, 0}
+		bz -= 2
+		placeOnZ = false
+	default: // facing east (+X)
+		faceDir = direction{0, -1}
+		bx += 2
+		placeOnZ = true
+	}
+	_ = placeOnZ
+
+	// Center the image horizontally
+	startX := bx - (imgW/2)*faceDir.dx
+	startZ := bz - (imgW/2)*faceDir.dz
+
+	placed := 0
+	for px := 0; px < imgW; px++ {
+		for py := 0; py < imgH; py++ {
+			r, g, b, a := scaled.At(bounds.Min.X+px, bounds.Min.Y+py).RGBA()
+			// Skip fully transparent pixels
+			if a < 0x8000 {
+				continue
+			}
+			blockID := nearestBlock(uint8(r>>8), uint8(g>>8), uint8(b>>8))
+
+			wx := startX + px*faceDir.dx
+			wy := by + (imgH - 1 - py) // bottom-up so image isn't flipped
+			wz := startZ + px*faceDir.dz
+
+			if wx < 0 || wx >= int(w.Width) || wy < 0 || wy >= int(w.Height) || wz < 0 || wz >= int(w.Length) {
+				continue
+			}
+
+			oldBlock := w.GetBlock(wx, wy, wz)
+			w.SetBlock(wx, wy, wz, blockID)
+			recordBlockChange(w.Name, "[pixelart:"+player.Username+"]", int16(wx), int16(wy), int16(wz), oldBlock, blockID)
+
+			// Broadcast to all players in the world
+			server.mu.RLock()
+			for _, p2 := range server.players {
+				if p2.World == w {
+					sendBlockUpdate(p2.Conn, int16(wx), int16(wy), int16(wz), blockID, p2.SupportsCPE)
+				}
+			}
+			server.mu.RUnlock()
+			placed++
+		}
+	}
+
+	player.SendMessage(fmt.Sprintf("&aPixel art placed! %d blocks (%dx%d)", placed, imgW, imgH))
+	log.Printf("[PixelArt] %s placed %dx%d (%d blocks) in %q from %s",
+		player.Username, imgW, imgH, placed, w.Name, imageURL)
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // MAIN
