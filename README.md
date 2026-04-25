@@ -1,3 +1,5 @@
+# === Moved to https://gitlab.com/tux_peng/goclassic ===
+
 # GoClassic
 
 A ClassiCube server written in Go with CPE support, multi-world portals, custom blocks, texture packs, block history, and a plugin system.
